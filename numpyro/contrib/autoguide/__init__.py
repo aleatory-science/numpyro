@@ -8,6 +8,7 @@
 """
 # Adapted from pyro.contrib.autoguide
 from abc import ABC, abstractmethod
+from contextlib import ExitStack
 import warnings
 
 from jax import hessian, random, vmap
@@ -21,6 +22,7 @@ from numpyro import handlers
 from numpyro.contrib.nn.auto_reg_nn import AutoregressiveNN
 from numpyro.contrib.nn.block_neural_arn import BlockNeuralAutoregressiveNN
 import numpyro.distributions as dist
+from numpyro.guides import ReinitGuide
 from numpyro.distributions import constraints
 from numpyro.distributions.flows import BlockNeuralAutoregressiveTransform, InverseAutoregressiveTransform
 from numpyro.distributions.transforms import (
@@ -57,8 +59,10 @@ class AutoGuide(ABC):
     :param str prefix: a prefix that will be prefixed to all param internal sites
     """
 
-    def __init__(self, model, prefix='auto'):
+    def __init__(self, model, prefix='auto', create_plates=None):
         assert isinstance(prefix, str)
+        self.create_plates = create_plates
+        self._prototype_frames = {}
         self.model = model
         self.prefix = prefix
         self.prototype_trace = None
@@ -101,6 +105,85 @@ class AutoGuide(ABC):
         self.prototype_trace = handlers.block(handlers.trace(model).get_trace)(*args, **kwargs)
         self._args = args
         self._kwargs = kwargs
+        for _, site in self.prototype_trace.items():
+            if site['type'] != 'sample' or site['is_observed']:
+                continue
+            for frame in site['cond_indep_stack']:
+                if frame.vectorized:
+                    self._prototype_frames[frame.name] = frame
+                else:
+                    raise NotImplementedError("AutoGuide does not support sequential numpyro.plate")
+
+    def _create_plates(self, *args, **kwargs):
+        if self.create_plates is None:
+            self.plates = {}
+        else:
+            plates = self.create_plates(*args, **kwargs)
+            if isinstance(plates, numpyro.plate):
+                plates = [plates]
+            assert all(isinstance(p, numpyro.plate) for p in plates), \
+                "create_plates() returned a non-plate"
+            self.plates = {p.name: p for p in plates}
+            for name, frame in sorted(self._prototype_frames.items()):
+                if name not in self.plates:
+                    self.plates[name] = numpyro.plate(name, frame.size, dim=frame.dim)
+        return self.plates
+
+
+class AutoDelta(AutoGuide, ReinitGuide):
+    def __init__(self, model, *, prefix='auto', init_strategy=init_to_uniform(), create_plates=None):
+        self.init_strategy = init_strategy
+        self._param_map = None
+        self._init_params = None
+        super(AutoDelta, self).__init__(model, prefix=prefix, create_plates=create_plates)
+
+    def init_params(self):
+        return self._init_params
+
+    def __call__(self, *args, **kwargs):
+        if self.prototype_trace is None:
+            self._setup_prototype(*args, **kwargs)
+        plates = self._create_plates(*args, **kwargs)
+        result = {}
+        for name, site in self.prototype_trace.items():
+            if site['type'] != 'sample' or site['is_observed']:
+                continue
+            with ExitStack() as stack:
+                for frame in site['cond_indep_stack']:
+                    stack.enter_context(plates[frame.name])
+                if site['intermediates']:
+                    event_ndim = len(site['fn'].base_dist.event_shape)
+                else:
+                    event_ndim = len(site['fn'].event_shape)
+                param_name, param_val, constraint = self._param_map[name]
+                val_param = numpyro.param(param_name, param_val, constraint=constraint)
+                result[name] = numpyro.sample(name, dist.Delta(val_param, event_ndim=event_ndim))
+        return result
+
+    def _sample_latent(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def sample_posterior(self, rng_key, *args, **kwargs):
+        raise NotImplementedError
+
+    def find_params(self, rng_keys, *args, **kwargs):
+        params = {}
+        init_params, _ = handlers.block(find_valid_initial_params)(rng_keys, self.model,
+                                                                   init_strategy=self.init_strategy,
+                                                                   model_args=args,
+                                                                   model_kwargs=kwargs)
+        for name, site in self.prototype_trace.items():
+            if site['type'] == 'sample' and not site['is_observed']:
+                param_name = "{}_{}".format(self.prefix, name)
+                param_val = biject_to(site['fn'].support)(init_params[name])
+                params[name] = (param_name, param_val, site['fn'].support)
+        self._param_map = params
+        self._init_params = {param: (val, constr) for param, val, constr in self._param_map.values()}
+
+    def _setup_prototype(self, *args, **kwargs):
+        super(AutoDelta, self)._setup_prototype(*args, **kwargs)
+        rng_key = numpyro.sample("_{}_rng_key_init".format(self.prefix), dist.PRNGIdentity())
+        self.find_params(rng_key, *args, **kwargs)
 
 
 class AutoContinuous(AutoGuide):

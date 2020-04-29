@@ -11,6 +11,7 @@ from numpyro.infer.util import (
     init_to_prior,
     init_to_uniform,
     init_to_value,
+    init_with_noise,
     log_likelihood
 )
 
@@ -20,6 +21,7 @@ __all__ = [
     'init_to_prior',
     'init_to_uniform',
     'init_to_value',
+    'init_with_noise',
     'log_likelihood',
     'ELBO',
     'RenyiELBO',

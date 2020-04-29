@@ -26,6 +26,7 @@ __all__ = [
     'init_to_prior',
     'init_to_uniform',
     'init_to_value',
+    'init_with_noise',
     'potential_energy',
     'initialize_model',
     'Predictive',
@@ -292,6 +293,20 @@ def init_to_value(values):
     return partial(_init_to_value, values=values)
 
 
+def init_with_noise(init_strategy, noise_scale=1.0):
+    def init(site, skip_param=False):
+        if isinstance(site['fn'], dist.TransformedDistribution):
+            fn = site['fn'].base_dist
+        else:
+            fn = site['fn']
+        vals = init_strategy(site, skip_param=skip_param)
+        if vals is not None:
+            base_transform = biject_to(fn.support)
+            unconstrained_init = numpyro.sample('_noisy_init', dist.Normal(loc=base_transform.inv(vals), scale=noise_scale))
+            return base_transform(unconstrained_init)
+    return init
+
+
 def find_valid_initial_params(rng_key, model,
                               init_strategy=init_to_uniform(),
                               param_as_improper=False,
@@ -428,7 +443,7 @@ def get_potential_fn(rng_key, model, dynamic_args=False, model_args=(), model_kw
     """
     if dynamic_args:
         def potential_fn(*args, **kwargs):
-            inv_transforms, replay_model = get_model_transforms(rng_key, model, args, kwargs)
+            inv_transforms, _ = get_model_transforms(rng_key, model, args, kwargs)
             return jax.partial(potential_energy, model, inv_transforms, args, kwargs)
 
         def postprocess_fn(*args, **kwargs):

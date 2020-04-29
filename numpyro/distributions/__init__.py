@@ -55,6 +55,7 @@ from numpyro.distributions.distribution import (
     TransformedDistribution,
     Unit
 )
+from numpyro.distributions.mixture import NormalMixture
 import numpyro.distributions.transforms  # noqa: F401
 from numpyro.distributions.transforms import biject_to
 
@@ -99,6 +100,7 @@ __all__ = [
     'MultivariateNormal',
     'LowRankMultivariateNormal',
     'Normal',
+    'NormalMixture',
     'OrderedLogistic',
     'Pareto',
     'Poisson',
