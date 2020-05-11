@@ -8,7 +8,6 @@ import jax
 from jax import lax
 
 import numpyro
-from numpyro.distributions.discrete import PRNGIdentity
 
 _PYRO_STACK = []
 
@@ -109,6 +108,30 @@ def sample(name, fn, obs=None, rng_key=None, sample_shape=()):
     return msg['value']
 
 
+def rng_key(name, count:int = 1, rng_key=None):
+    def new_rng_key(*, rng_key):
+        _, *keys = jax.random.split(rng_key, count + 1)
+        if count == 1:
+            return keys[0]
+        else:
+            return jax.numpy.stack(keys, axis=0)
+    
+    if not _PYRO_STACK:
+        return new_rng_key(rng_key=rng_key)
+    
+    initial_msg = {
+        'type': 'rng_key',
+        'name': name,
+        'value': None,
+        'fn': new_rng_key,
+        'args': (),
+        'kwargs': {'rng_key': rng_key}
+    }
+
+    msg = apply_stack(initial_msg)
+    return msg['value']
+
+
 def identity(x, *args, **kwargs):
     return x
 
@@ -196,7 +219,7 @@ def module(name, nn, input_shape=None):
     if nn_params is None:
         if input_shape is None:
             raise ValueError('Valid value for `input_size` needed to initialize.')
-        rng_key = numpyro.sample(name + '$rng_key', PRNGIdentity())
+        rng_key = numpyro.rng_key(name + '$rng_key')
         _, nn_params = nn_init(rng_key, input_shape)
         param(module_key, nn_params)
     return jax.partial(nn_apply, nn_params)

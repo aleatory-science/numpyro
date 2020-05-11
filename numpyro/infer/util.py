@@ -228,7 +228,7 @@ def _init_to_uniform(site, radius=2, skip_param=False):
         value = numpyro.sample('_init', fn, sample_shape=site['kwargs']['sample_shape'])
         base_transform = biject_to(fn.support)
         unconstrained_value = numpyro.sample('_unconstrained_init', dist.Uniform(-radius, radius),
-                                             sample_shape=np.shape(base_transform.inv(value)))
+                                            sample_shape=np.shape(base_transform.inv(value)))
         return base_transform(unconstrained_value)
 
     if site['type'] == 'param' and not skip_param:
