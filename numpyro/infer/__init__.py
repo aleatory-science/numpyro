@@ -4,6 +4,7 @@
 from numpyro.infer.elbo import ELBO, RenyiELBO
 from numpyro.infer.mcmc import HMC, MCMC, NUTS, SA
 from numpyro.infer.svi import SVI
+from numpyro.infer.stein import SVGD
 from numpyro.infer.util import (
     Predictive,
     init_to_feasible,
@@ -31,4 +32,5 @@ __all__ = [
     'Predictive',
     'SA',
     'SVI',
+    'SVGD'
 ]
