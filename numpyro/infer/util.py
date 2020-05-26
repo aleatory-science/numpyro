@@ -301,7 +301,11 @@ def init_with_noise(init_strategy, noise_scale=1.0):
             fn = site['fn']
         vals = init_strategy(site, skip_param=skip_param)
         if vals is not None:
-            base_transform = biject_to(fn.support)
+            if site['type'] == 'param':
+                constraint = site['kwargs'].pop('constraint', real)
+                base_transform = biject_to(constraint)
+            else:
+                base_transform = biject_to(fn.support)
             unconstrained_init = numpyro.sample('_noisy_init', dist.Normal(loc=base_transform.inv(vals), scale=noise_scale))
             return base_transform(unconstrained_init)
     return init
