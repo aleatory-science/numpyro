@@ -86,8 +86,7 @@ class Stein(VI):
         self.guide_param_names = None
         self.constrain_fn = None
         self.uconstrain_fn = None
-        self.transform = None
-        self.inv_transform = None
+        self.particle_transforms = None
 
     def _apply_kernel(self, kernel, x, y, v):
         if self.kernel_fn.mode == 'norm' or self.kernel_fn.mode == 'vector':
@@ -267,16 +266,10 @@ class Stein(VI):
                 if site['name'] in guide_trace:
                     guide_param_names.add(site['name'])
 
-        self._set_model_guide_attrs(guide_param_names, transforms, inv_transforms)
-
-        return SteinState(self.optim.init(params), rng_key)
-
-    def _set_model_guide_attrs(self, guide_param_names, transforms, inv_transforms):
         self.guide_param_names = guide_param_names
-        self.transforms = transforms
-        self.inv_transforms = inv_transforms
         self.constrain_fn = partial(transform_fn, inv_transforms)
         self.uconstrain_fn = partial(transform_fn, transforms)
+        return SteinState(self.optim.init(params), rng_key)
 
     def get_params(self, state):
         """
