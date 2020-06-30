@@ -335,3 +335,4 @@ def safe_norm(a, ord=2, axis=None):
         is_zero = jnp.ones_like(a, dtype='bool')
     norm = jnp.linalg.norm(a + jnp.where(is_zero, jnp.ones_like(a) * 1e-5 ** ord, jnp.zeros_like(a)), ord=ord, axis=axis)
     return norm
+

@@ -141,7 +141,8 @@ def param(name, init_value=None, **kwargs):
 
     # ...and use apply_stack to send it to the Messengers
     msg = apply_stack(initial_msg)
-    return msg['value']
+    transform = msg['kwargs'].get('transform', lambda x: x)
+    return transform(msg['value'])
 
 
 def rng_key(name, count:int = 1, rng_key=None):

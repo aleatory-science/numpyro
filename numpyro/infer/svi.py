@@ -6,12 +6,9 @@ from functools import namedtuple, partial
 import jax
 from jax import random, value_and_grad
 
-from numpyro import handlers
-from numpyro.distributions import constraints
-from numpyro.distributions.transforms import biject_to
 from numpyro.handlers import seed, trace
 from numpyro.infer import VI
-from numpyro.infer.util import transform_fn
+from numpyro.infer.util import transform_fn, get_parameter_transform
 
 SVIState = namedtuple('SVIState', ['optim_state', 'rng_key'])
 """
@@ -66,8 +63,7 @@ class SVI(VI):
         # NB: params in model_trace will be overwritten by params in guide_trace
         for site in list(model_trace.values()) + list(guide_trace.values()):
             if site['type'] == 'param':
-                constraint = site['kwargs'].pop('constraint', constraints.real)
-                transform = biject_to(constraint)
+                transform = get_parameter_transform(site)
                 inv_transforms[site['name']] = transform
                 params[site['name']] = transform.inv(site['value'])
 

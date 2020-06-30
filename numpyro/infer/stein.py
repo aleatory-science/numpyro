@@ -18,7 +18,7 @@ from numpyro.distributions.transforms import biject_to
 from numpyro.infer import NUTS, MCMC, VI
 from numpyro.infer.guide import ReinitGuide
 from numpyro.infer.kernels import SteinKernel
-from numpyro.infer.util import transform_fn
+from numpyro.infer.util import transform_fn, get_parameter_transform
 from numpyro.util import ravel_pytree
 
 # TODO
@@ -252,8 +252,7 @@ class Stein(VI):
         # NB: params in model_trace will be overwritten by params in guide_trace
         for site in list(model_trace.values()) + list(guide_trace.values()):
             if site['type'] == 'param':
-                constraint = site['kwargs'].pop('constraint', constraints.real)
-                transform = biject_to(constraint)
+                transform = get_parameter_transform(site)
                 inv_transforms[site['name']] = transform
                 transforms[site['name']] = transform.inv
                 if site['name'] in guide_init_params:
@@ -328,8 +327,9 @@ class Stein(VI):
                           p not in self.guide_param_names or self.classic_guide_params_fn(p)}
         stein_params = {p: v for p, v in params.items() if p not in classic_params}
         if num_samples == 1:
-            return jax.vmap(lambda sp: self._predict_model(rng_key_predict, {**sp, **classic_params}), *args, **kwargs
+            return jax.vmap(lambda sp: self._predict_model(rng_key_predict, {**sp, **classic_params}, *args, **kwargs)
                             )(stein_params)
         else:
-            return jax.vmap(lambda rk: jax.vmap(lambda sp: self._predict_model(rk, {**sp, **classic_params})
+            return jax.vmap(lambda rk: jax.vmap(lambda sp: self._predict_model(rk, {**sp, **classic_params},
+                                                                               *args, **kwargs)
                                                 )(stein_params))(jax.random.split(rng_key_predict, num_samples))

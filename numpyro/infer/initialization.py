@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions import biject_to
+import numpyro.infer.util as util
 
 
 def init_to_median(site=None, reinit_param=lambda site: False, num_samples=15):
@@ -71,8 +72,7 @@ def init_to_uniform(site=None, radius=2, reinit_param=lambda site: False):
             transform = biject_to(site['fn'].support)
         elif site['type'] == 'param':
             prototype_value = site['args'][0]
-            constraint = site['kwargs'].pop('constraint', dist.constraints.real)
-            transform = biject_to(constraint)
+            transform = util.get_parameter_transform(site)
         unconstrained_shape = jnp.shape(transform.inv(prototype_value))
         unconstrained_samples = dist.Uniform(-radius, radius).sample(
             rng_key, sample_shape=sample_shape + unconstrained_shape)
@@ -116,8 +116,7 @@ def init_with_noise(init_strategy, site=None, noise_scale=1.0, reinit_param=lamb
         fn = site['fn']
     if vals is not None:
         if site['type'] == 'param':
-            constraint = site['kwargs'].pop('constraint', dist.constraints.real)
-            base_transform = biject_to(constraint)
+            base_transform = get_parameter_transform(site)
         elif site['type'] == 'sample':
             base_transform = biject_to(fn.support)
         rng_key = site['kwargs'].get('rng_key')

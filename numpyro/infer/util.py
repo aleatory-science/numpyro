@@ -11,7 +11,7 @@ import jax.numpy as jnp
 
 import numpyro
 from numpyro.distributions.constraints import _GreaterThan, _Interval, real, real_vector
-from numpyro.distributions.transforms import biject_to
+from numpyro.distributions.transforms import biject_to, IdentityTransform, ComposeTransform
 from numpyro.distributions.util import is_identically_one, sum_rightmost
 from numpyro.handlers import seed, substitute, trace
 from numpyro.infer.initialization import init_to_uniform, init_to_value
@@ -25,6 +25,7 @@ __all__ = [
     'potential_energy',
     'initialize_model',
     'Predictive',
+    'get_parameter_transform'
 ]
 
 ModelInfo = namedtuple('ModelInfo', ['param_info', 'potential_fn', 'postprocess_fn', 'model_trace'])
@@ -115,15 +116,17 @@ def _unconstrain_reparam(params, site):
     name = site['name']
     if name in params:
         p = params[name]
+        t = None
+        support = None
         if site['type'] == 'sample':
-            support = site['fn'].support 
+            support = site['fn'].support
             event_dim = len(site['fn'].event_shape)
+            t = biject_to(support)
         elif site['type'] == 'param':
-            support = site['kwargs'].pop('constraint', real)
             event_dim = 0
+            t = get_parameter_transform(site)
         if support in [real, real_vector]:
             return p
-        t = biject_to(support)
         value = t(p)
 
         log_det = t.log_abs_det_jacobian(p, value)
@@ -215,8 +218,7 @@ def find_valid_initial_params(rng_key, model,
                     if v['type'] == 'sample':
                         inv_transforms[k] = biject_to(v['fn'].support)
                     elif v['type'] == 'param':
-                        constraint = v['kwargs'].pop('constraint', real)
-                        inv_transforms[k] = biject_to(constraint)
+                        inv_transforms[k] = get_parameter_transform(v)
                 elif v['type'] == 'sample' and not v['is_observed'] and not v['fn'].is_discrete:
                     constrained_values[k] = v['value']
                     inv_transforms[k] = biject_to(v['fn'].support)
@@ -259,6 +261,12 @@ def find_valid_initial_params(rng_key, model,
     else:
         (init_params, pe, z_grad), is_valid = lax.map(_find_valid_params, rng_key)
     return (init_params, pe, z_grad), is_valid
+
+
+def get_parameter_transform(site):
+    constraint = site['kwargs'].get('constraint', real)
+    transform = site['kwargs'].get('transform', IdentityTransform())
+    return ComposeTransform([transform, biject_to(constraint)])
 
 
 def _get_model_transforms(model, model_args=(), model_kwargs=None):
