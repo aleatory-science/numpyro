@@ -116,7 +116,7 @@ def init_with_noise(init_strategy, site=None, noise_scale=1.0, reinit_param=lamb
         fn = site['fn']
     if vals is not None:
         if site['type'] == 'param':
-            base_transform = get_parameter_transform(site)
+            base_transform = util.get_parameter_transform(site)
         elif site['type'] == 'sample':
             base_transform = biject_to(fn.support)
         rng_key = site['kwargs'].get('rng_key')

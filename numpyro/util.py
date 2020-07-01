@@ -286,29 +286,18 @@ def _ravel_list(*leaves, batch_dims):
                             m.shape[batch_dims:]).astype(m.dtype)
                 for i, m in enumerate(leaves_metadata)]
 
-    def unravel_list_batched(arr):
-        return [jnp.reshape(lax.dynamic_slice_in_dim(arr, leaves_idx[i], m.event_size, axis=batch_dims),
-                           m.shape).astype(m.dtype)
-                for i, m in enumerate(leaves_metadata)]
-
     flat = jnp.concatenate([m.flat for m in leaves_metadata], axis=-1) if leaves_metadata else jnp.array([])
-    return flat, unravel_list, unravel_list_batched
+    return flat, unravel_list
 
 
 def ravel_pytree(pytree, *, batch_dims=0):
     leaves, treedef = tree_flatten(pytree)
-    flat, unravel_list, unravel_list_batched = _ravel_list(*leaves, batch_dims=batch_dims)
+    flat, unravel_list = _ravel_list(*leaves, batch_dims=batch_dims)
 
     def unravel_pytree(arr):
         return tree_unflatten(treedef, unravel_list(arr))
 
-    def unravel_pytree_batched(arr):
-        return tree_unflatten(treedef, unravel_list_batched(arr))
-
-    if batch_dims > 0:
-        return flat, unravel_pytree, unravel_pytree_batched
-    else:
-        return flat, unravel_pytree
+    return flat, unravel_pytree
 
 
 def posdef(m):

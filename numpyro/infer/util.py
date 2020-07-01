@@ -265,7 +265,7 @@ def find_valid_initial_params(rng_key, model,
 
 def get_parameter_transform(site):
     constraint = site['kwargs'].get('constraint', real)
-    transform = site['kwargs'].get('transform', IdentityTransform())
+    transform = site['kwargs'].get('particle_transform', IdentityTransform())
     return ComposeTransform([transform, biject_to(constraint)])
 
 

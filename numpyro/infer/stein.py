@@ -14,7 +14,7 @@ from jax.tree_util import tree_map
 
 from numpyro import handlers
 from numpyro.distributions import constraints
-from numpyro.distributions.transforms import biject_to
+from numpyro.distributions.transforms import biject_to, IdentityTransform
 from numpyro.infer import NUTS, MCMC, VI
 from numpyro.infer.guide import ReinitGuide
 from numpyro.infer.kernels import SteinKernel
@@ -86,7 +86,7 @@ class Stein(VI):
         self.guide_param_names = None
         self.constrain_fn = None
         self.uconstrain_fn = None
-        self.particle_transforms = None
+        self.particle_transform_fn = None
 
     def _apply_kernel(self, kernel, x, y, v):
         if self.kernel_fn.mode == 'norm' or self.kernel_fn.mode == 'vector':
@@ -98,7 +98,7 @@ class Stein(VI):
         if self.kernel_fn.mode == 'norm':
             return jax.grad(lambda x: kernel(x, y))(x)
         elif self.kernel_fn.mode == 'vector':
-            return jax.vmap(lambda i: jax.grad(lambda xi: kernel(xi, y[i])[i])(x[i]))(jnp.arange(x.shape[0]))
+            return jax.vmap(lambda i: jax.grad(lambda x: kernel(x, y)[i])(x)[i])(jnp.arange(x.shape[0]))
         else:
             return jax.vmap(lambda l: jnp.sum(jax.vmap(lambda m: jax.grad(lambda x: kernel(x, y)[l, m])(x)[m])
                                               (jnp.arange(x.shape[0]))))(jnp.arange(x.shape[0]))
@@ -126,7 +126,8 @@ class Stein(VI):
         stein_uparams = {p: v for p, v in unconstr_params.items() if p not in classic_uparams}
         # 1. Collect each guide parameter into monolithic particles that capture correlations
         # between parameter values across each individual particle
-        stein_particles, unravel_pytree, unravel_pytree_batched = ravel_pytree(stein_uparams, batch_dims=1)
+        stein_particles, unravel_pytree = ravel_pytree(stein_uparams, batch_dims=1)
+        unravel_pytree_batched = jax.vmap(unravel_pytree)
         particle_info = self._calc_particle_info(stein_uparams, stein_particles.shape[0])
 
         # 2. Calculate loss and gradients for each parameter
@@ -145,8 +146,17 @@ class Stein(VI):
             classic_uparams))(stein_particles)
         classic_param_grads = tree_map(partial(jnp.mean, axis=0), classic_param_grads)
 
+        def particle_transform_fn(particle):
+            params = unravel_pytree(particle)
+            tparams = self.particle_transform_fn(params)
+            tparticle, _ = ravel_pytree(tparams)
+            # TODO: Figure out what to do with transformations that are not shape preserving
+            assert particle.shape == tparticle.shape
+            return tparticle
+
         # 3. Calculate kernel on monolithic particle
-        kernel = self.kernel_fn.compute(stein_particles, particle_info, kernel_particle_loss_fn)
+        kernel = self.kernel_fn.compute(stein_particles, particle_info, kernel_particle_loss_fn,
+                                        particle_transform_fn)
 
         # 4. Calculate the attractive force and repulsive force on the monolithic particles
         attractive_force = jax.vmap(lambda y: jnp.sum(
@@ -248,6 +258,7 @@ class Stein(VI):
         params = {}
         transforms = {}
         inv_transforms = {}
+        particle_transforms = {}
         guide_param_names = set()
         # NB: params in model_trace will be overwritten by params in guide_trace
         for site in list(model_trace.values()) + list(guide_trace.values()):
@@ -255,6 +266,7 @@ class Stein(VI):
                 transform = get_parameter_transform(site)
                 inv_transforms[site['name']] = transform
                 transforms[site['name']] = transform.inv
+                particle_transforms[site['name']] = site.get('particle_transform', IdentityTransform())
                 if site['name'] in guide_init_params:
                     pval, _ = guide_init_params[site['name']]
                     if self.classic_guide_params_fn(site['name']):
@@ -268,6 +280,7 @@ class Stein(VI):
         self.guide_param_names = guide_param_names
         self.constrain_fn = partial(transform_fn, inv_transforms)
         self.uconstrain_fn = partial(transform_fn, transforms)
+        self.particle_transform_fn = partial(transform_fn, particle_transforms)
         return SteinState(self.optim.init(params), rng_key)
 
     def get_params(self, state):
