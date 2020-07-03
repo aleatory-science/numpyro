@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import namedtuple
+from contextlib import contextmanager, ExitStack
 import functools
 
-import jax
 from jax import lax
+import jax
 
 import numpyro
+from numpyro.util import identity
 
 _PYRO_STACK = []
 
@@ -96,7 +98,6 @@ def sample(name, fn, obs=None, rng_key=None, sample_shape=()):
         'args': (),
         'kwargs': {'rng_key': rng_key, 'sample_shape': sample_shape},
         'value': obs,
-        'mask': None,
         'scale': None,
         'is_observed': obs is not None,
         'intermediates': [],
@@ -106,34 +107,6 @@ def sample(name, fn, obs=None, rng_key=None, sample_shape=()):
     # ...and use apply_stack to send it to the Messengers
     msg = apply_stack(initial_msg)
     return msg['value']
-
-
-def rng_key(name, count:int = 1, rng_key=None):
-    def new_rng_key(*, rng_key):
-        _, *keys = jax.random.split(rng_key, count + 1)
-        if count == 1:
-            return keys[0]
-        else:
-            return jax.numpy.stack(keys, axis=0)
-    
-    if not _PYRO_STACK:
-        return new_rng_key(rng_key=rng_key)
-    
-    initial_msg = {
-        'type': 'rng_key',
-        'name': name,
-        'value': None,
-        'fn': new_rng_key,
-        'args': (),
-        'kwargs': {'rng_key': rng_key}
-    }
-
-    msg = apply_stack(initial_msg)
-    return msg['value']
-
-
-def identity(x, *args, **kwargs):
-    return x
 
 
 def param(name, init_value=None, **kwargs):
@@ -163,12 +136,35 @@ def param(name, init_value=None, **kwargs):
         'args': (init_value,),
         'kwargs': kwargs,
         'value': None,
-        'mask': None,
-        'scale': None,
         'cond_indep_stack': [],
     }
 
     # ...and use apply_stack to send it to the Messengers
+    msg = apply_stack(initial_msg)
+    transform = msg['kwargs'].get('transform', lambda x: x)
+    return transform(msg['value'])
+
+
+def rng_key(name, count:int = 1, rng_key=None):
+    def new_rng_key(*, rng_key):
+        _, *keys = jax.random.split(rng_key, count + 1)
+        if count == 1:
+            return keys[0]
+        else:
+            return jax.numpy.stack(keys, axis=0)
+    
+    if not _PYRO_STACK:
+        return new_rng_key(rng_key=rng_key)
+    
+    initial_msg = {
+        'type': 'rng_key',
+        'name': name,
+        'value': None,
+        'fn': new_rng_key,
+        'args': (),
+        'kwargs': {'rng_key': rng_key}
+    }
+
     msg = apply_stack(initial_msg)
     return msg['value']
 
@@ -222,7 +218,7 @@ def module(name, nn, input_shape=None):
         rng_key = numpyro.rng_key(name + '$rng_key')
         _, nn_params = nn_init(rng_key, input_shape)
         param(module_key, nn_params)
-    return jax.partial(nn_apply, nn_params)
+    return functools.partial(nn_apply, nn_params)
 
 
 class plate(Messenger):
@@ -286,26 +282,43 @@ class plate(Messenger):
     def process_message(self, msg):
         if msg['type'] not in ('sample', 'plate'):
             return
+
         cond_indep_stack = msg['cond_indep_stack']
         frame = CondIndepStackFrame(self.name, self.dim, self.subsample_size)
         cond_indep_stack.append(frame)
         expected_shape = self._get_batch_shape(cond_indep_stack)
-        dist_batch_shape = msg['fn'].batch_shape if msg['type'] == 'sample' else ()
-        overlap_idx = max(len(expected_shape) - len(dist_batch_shape), 0)
-        trailing_shape = expected_shape[overlap_idx:]
-        # e.g. distribution with batch shape (1, 5) cannot be broadcast to (5, 5)
-        broadcast_shape = lax.broadcast_shapes(trailing_shape, dist_batch_shape)
-        if broadcast_shape != dist_batch_shape:
-            raise ValueError('Distribution batch shape = {} cannot be broadcast up to {}. '
-                             'Consider using unbatched distributions.'
-                             .format(dist_batch_shape, broadcast_shape))
-        batch_shape = expected_shape[:overlap_idx]
-        if 'sample_shape' in msg['kwargs']:
-            batch_shape = lax.broadcast_shapes(msg['kwargs']['sample_shape'], batch_shape)
-        msg['kwargs']['sample_shape'] = batch_shape
+        if msg['type'] == 'sample':
+            dist_batch_shape = msg['fn'].batch_shape
+            if 'sample_shape' in msg['kwargs']:
+                dist_batch_shape = msg['kwargs']['sample_shape'] + dist_batch_shape
+                msg['kwargs']['sample_shape'] = ()
+            overlap_idx = max(len(expected_shape) - len(dist_batch_shape), 0)
+            trailing_shape = expected_shape[overlap_idx:]
+            broadcast_shape = lax.broadcast_shapes(trailing_shape, dist_batch_shape)
+            batch_shape = expected_shape[:overlap_idx] + broadcast_shape
+            msg['fn'] = msg['fn'].expand(batch_shape)
         if self.size != self.subsample_size:
             scale = 1. if msg['scale'] is None else msg['scale']
             msg['scale'] = scale * self.size / self.subsample_size
+
+
+@contextmanager
+def plate_stack(prefix, sizes, rightmost_dim=-1):
+    """
+    Create a contiguous stack of :class:`plate` s with dimensions::
+
+        rightmost_dim - len(sizes), ..., rightmost_dim
+
+    :param str prefix: Name prefix for plates.
+    :param iterable sizes: An iterable of plate sizes.
+    :param int rightmost_dim: The rightmost dim, counting from the right.
+    """
+    assert rightmost_dim < 0
+    with ExitStack() as stack:
+        for i, size in enumerate(reversed(sizes)):
+            plate_i = plate("{}_{}".format(prefix, i), size, dim=rightmost_dim - i)
+            stack.enter_context(plate_i)
+        yield
 
 
 def factor(name, log_factor):

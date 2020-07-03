@@ -29,7 +29,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 import warnings
 
-import jax.numpy as np
+import jax.numpy as jnp
 from jax import lax
 
 from numpyro.distributions.constraints import is_dependent, real
@@ -91,9 +91,9 @@ class Distribution(object):
 
     .. doctest::
 
-       >>> import jax.numpy as np
+       >>> import jax.numpy as jnp
        >>> import numpyro.distributions as dist
-       >>> d = dist.Dirichlet(np.ones((2, 3, 4)))
+       >>> d = dist.Dirichlet(jnp.ones((2, 3, 4)))
        >>> d.batch_shape
        (2, 3)
        >>> d.event_shape
@@ -123,7 +123,7 @@ class Distribution(object):
                     continue
                 if is_dependent(constraint):
                     continue  # skip constraints that cannot be checked
-                is_valid = np.all(constraint(getattr(self, param)))
+                is_valid = jnp.all(constraint(getattr(self, param)))
                 if not_jax_tracer(is_valid):
                     if not is_valid:
                         raise ValueError("The parameter {} has invalid values".format(param))
@@ -150,6 +150,29 @@ class Distribution(object):
         """
         return self._event_shape
 
+    @property
+    def event_dim(self):
+        """
+        :return: Number of dimensions of individual events.
+        :rtype: int
+        """
+        return len(self.event_shape)
+
+    def shape(self, sample_shape=()):
+        """
+        The tensor shape of samples from this distribution.
+
+        Samples are of shape::
+
+            d.shape(sample_shape) == sample_shape + d.batch_shape + d.event_shape
+
+        :param tuple sample_shape: the size of the iid batch to be drawn from the
+            distribution.
+        :return: shape of samples.
+        :rtype: tuple
+        """
+        return sample_shape + self.batch_shape + self.event_shape
+
     def sample(self, key, sample_shape=()):
         """
         Returns a sample from the distribution having shape given by
@@ -175,9 +198,6 @@ class Distribution(object):
         :rtype: numpy.ndarray
         """
         return self.sample(key, sample_shape=sample_shape), []
-
-    def transform_with_intermediates(self, base_value):
-        return base_value, []
 
     def log_prob(self, value):
         """
@@ -207,7 +227,7 @@ class Distribution(object):
     def _validate_sample(self, value):
         mask = self.support(value)
         if not_jax_tracer(mask):
-            if not np.all(mask):
+            if not jnp.all(mask):
                 warnings.warn('Out-of-support values provided to log prob method. '
                               'The value argument should be within the support.')
         return mask
@@ -231,6 +251,8 @@ class Distribution(object):
         """
         if reinterpreted_batch_ndims is None:
             reinterpreted_batch_ndims = len(self.batch_shape)
+        elif reinterpreted_batch_ndims == 0:
+            return self
         return Independent(self, reinterpreted_batch_ndims)
 
     def enumerate_support(self, expand=True):
@@ -249,7 +271,24 @@ class Distribution(object):
         :return: an instance of `ExpandedDistribution`.
         :rtype: :class:`ExpandedDistribution`
         """
+        batch_shape = tuple(batch_shape)
+        if batch_shape == self.batch_shape:
+            return self
         return ExpandedDistribution(self, batch_shape)
+
+    def expand_by(self, sample_shape):
+        """
+        Expands a distribution by adding ``sample_shape`` to the left side of
+        its :attr:`~numpyro.distributions.distribution.Distribution.batch_shape`.
+        To expand internal dims of ``self.batch_shape`` from 1 to something
+        larger, use :meth:`expand` instead.
+
+        :param tuple sample_shape: The size of the iid batch to be drawn
+            from the distribution.
+        :return: An expanded version of this distribution.
+        :rtype: :class:`ExpandedDistribution`
+        """
+        return self.expand(tuple(sample_shape) + self._batch_shape)
 
     def mask(self, mask):
         """
@@ -258,10 +297,12 @@ class Distribution(object):
         :attr:`Distribution.batch_shape` .
 
         :param mask: A boolean or boolean valued array.
-        :type mask: bool or np.ndarray
+        :type mask: bool or jnp.ndarray
         :return: A masked copy of this distribution.
         :rtype: :class:`MaskedDistribution`
         """
+        if mask is True:
+            return self
         return MaskedDistribution(self, mask)
 
 
@@ -269,6 +310,9 @@ class ExpandedDistribution(Distribution):
     arg_constraints = {}
 
     def __init__(self, base_dist, batch_shape=()):
+        if isinstance(base_dist, ExpandedDistribution):
+            batch_shape = self._broadcast_shape(base_dist.batch_shape, batch_shape)
+            base_dist = base_dist.base_dist
         self.base_dist = base_dist
         super().__init__(base_dist.batch_shape, base_dist.event_shape)
         # adjust batch shape
@@ -328,13 +372,14 @@ class ExpandedDistribution(Distribution):
         interstitial_idx = len(sample_shape) + len(expanded_sizes)
         interstitial_sample_dims = tuple(range(interstitial_idx, interstitial_idx + len(interstitial_sizes)))
         for dim1, dim2 in zip(interstitial_dims, interstitial_sample_dims):
-            samples = np.swapaxes(samples, dim1, dim2)
+            samples = jnp.swapaxes(samples, dim1, dim2)
         return samples.reshape(sample_shape + self.batch_shape + self.event_shape)
 
     def log_prob(self, value):
-        shape = lax.broadcast_shapes(self.batch_shape, np.shape(value)[:max(np.ndim(value) - len(self.event_shape), 0)])
+        shape = lax.broadcast_shapes(self.batch_shape,
+                                     jnp.shape(value)[:max(jnp.ndim(value) - self.event_dim, 0)])
         log_prob = self.base_dist.log_prob(value)
-        return np.broadcast_to(log_prob, shape)
+        return jnp.broadcast_to(log_prob, shape)
 
     def enumerate_support(self, expand=True):
         samples = self.base_dist.enumerate_support(expand=False)
@@ -346,11 +391,81 @@ class ExpandedDistribution(Distribution):
 
     @property
     def mean(self):
-        return np.broadcast_to(self.base_dist.mean, self.batch_shape + self.event_shape)
+        return jnp.broadcast_to(self.base_dist.mean, self.batch_shape + self.event_shape)
 
     @property
     def variance(self):
-        return np.broadcast_to(self.base_dist.variance, self.batch_shape + self.event_shape)
+        return jnp.broadcast_to(self.base_dist.variance, self.batch_shape + self.event_shape)
+
+
+class ImproperUniform(Distribution):
+    """
+    A helper distribution with zero :meth:`log_prob` over the `support` domain.
+
+    .. note:: `sample` method is not implemented for this distribution. In autoguide and mcmc,
+        initial parameters for improper sites are derived from `init_to_uniform` or `init_to_value`
+        strategies.
+
+    **Usage:**
+
+    .. doctest::
+
+       >>> from numpyro import sample
+       >>> from numpyro.distributions import ImproperUniform, Normal, constraints
+       >>>
+       >>> def model():
+       ...     # ordered vector with length 10
+       ...     x = sample('x', ImproperUniform(constraints.ordered_vector, (), event_shape=(10,)))
+       ...
+       ...     # real matrix with shape (3, 4)
+       ...     y = sample('y', ImproperUniform(constraints.real, (), event_shape=(3, 4)))
+       ...
+       ...     # a shape-(6, 8) batch of length-5 vectors greater than 3
+       ...     z = sample('z', ImproperUniform(constraints.greater_than(3), (6, 8), event_shape=(5,)))
+
+    If you want to set improper prior over all values greater than `a`, where `a` is
+    another random variable, you might use
+
+       >>> def model():
+       ...     a = sample('a', Normal(0, 1))
+       ...     x = sample('x', ImproperUniform(constraints.greater_than(a), (), event_shape=()))
+
+    or if you want to reparameterize it
+
+       >>> from numpyro.distributions import TransformedDistribution, transforms
+       >>> from numpyro.handlers import reparam
+       >>> from numpyro.infer.reparam import TransformReparam
+       >>>
+       >>> def model():
+       ...     a = sample('a', Normal(0, 1))
+       ...     with reparam(config={'x': TransformReparam()}):
+       ...         x = sample('x',
+       ...                    TransformedDistribution(ImproperUniform(constraints.positive, (), ()),
+       ...                                            transforms.AffineTransform(a, 1)))
+
+    :param ~numpyro.distributions.constraints.Constraint support: the support of this distribution.
+    :param tuple batch_shape: batch shape of this distribution. It is usually safe to
+        set `batch_shape=()`.
+    :param tuple event_shape: event shape of this distribution.
+    """
+    arg_constraints = {}
+
+    def __init__(self, support, batch_shape, event_shape, validate_args=None):
+        self.support = support
+        super().__init__(batch_shape, event_shape, validate_args=validate_args)
+
+    @validate_sample
+    def log_prob(self, value):
+        batch_shape = jnp.shape(value)[:jnp.ndim(value) - len(self.event_shape)]
+        batch_shape = lax.broadcast_shapes(batch_shape, self.batch_shape)
+        return jnp.zeros(batch_shape)
+
+    def _validate_sample(self, value):
+        mask = super(ImproperUniform, self)._validate_sample(value)
+        batch_dim = jnp.ndim(value) - len(self.event_shape)
+        if batch_dim < jnp.ndim(mask):
+            mask = jnp.all(jnp.reshape(mask, jnp.shape(mask)[:batch_dim] + (-1,)), -1)
+        return mask
 
 
 class Independent(Distribution):
@@ -365,7 +480,7 @@ class Independent(Distribution):
     .. doctest::
 
         >>> import numpyro.distributions as dist
-        >>> normal = dist.Normal(np.zeros(3), np.ones(3))
+        >>> normal = dist.Normal(jnp.zeros(3), jnp.ones(3))
         >>> [normal.batch_shape, normal.event_shape]
         [(3,), ()]
         >>> diag_normal = dist.Independent(normal, 1)
@@ -430,7 +545,7 @@ class MaskedDistribution(Distribution):
     and constant zero values are returned instead.
 
     :param mask: A boolean or boolean-valued array.
-    :type mask: np.ndarray or bool
+    :type mask: jnp.ndarray or bool
     """
     arg_constraints = {}
 
@@ -438,9 +553,9 @@ class MaskedDistribution(Distribution):
         if isinstance(mask, bool):
             self._mask = mask
         else:
-            batch_shape = lax.broadcast_shapes(np.shape(mask), base_dist.batch_shape)
+            batch_shape = lax.broadcast_shapes(jnp.shape(mask), base_dist.batch_shape)
             if mask.shape != batch_shape:
-                mask = np.broadcast_to(mask, batch_shape)
+                mask = jnp.broadcast_to(mask, batch_shape)
             if base_dist.batch_shape != batch_shape:
                 base_dist = base_dist.expand(batch_shape)
             self._mask = mask.astype('bool')
@@ -465,8 +580,8 @@ class MaskedDistribution(Distribution):
     def log_prob(self, value):
         if self._mask is False:
             shape = lax.broadcast_shapes(self.base_dist.batch_shape,
-                                         np.shape(value)[:max(np.ndim(value) - len(self.event_shape), 0)])
-            return np.zeros(shape)
+                                         jnp.shape(value)[:max(jnp.ndim(value) - len(self.event_shape), 0)])
+            return jnp.zeros(shape)
         if self._mask is True:
             return self.base_dist.log_prob(value)
         return self.base_dist.log_prob(value) * self._mask
@@ -515,6 +630,13 @@ class TransformedDistribution(Distribution):
         else:
             self.base_dist = base_distribution
             self.transforms = transforms
+        # NB: here we assume that base_dist.shape == transformed_dist.shape
+        # but that might not be True for some transforms such as StickBreakingTransform
+        # because the event dimension is transformed from (n - 1,) to (n,).
+        # Currently, we have no mechanism to fix this issue. Given that
+        # this is just an edge case, we might skip this issue but need
+        # to pay attention to any inference function that inspects
+        # transformed distribution's shape.
         shape = base_distribution.batch_shape + base_distribution.event_shape
         event_dim = max([len(base_distribution.event_shape)] + [t.event_dim for t in transforms])
         batch_shape = shape[:len(shape) - event_dim]
@@ -536,11 +658,7 @@ class TransformedDistribution(Distribution):
         return x
 
     def sample_with_intermediates(self, key, sample_shape=()):
-        base_value = self.base_dist.sample(key, sample_shape)
-        return self.transform_with_intermediates(base_value)
-
-    def transform_with_intermediates(self, base_value):
-        x = base_value
+        x = self.base_dist.sample(key, sample_shape)
         intermediates = []
         for transform in self.transforms:
             x_tmp = x
@@ -589,14 +707,14 @@ class Unit(Distribution):
     support = real
 
     def __init__(self, log_factor, validate_args=None):
-        batch_shape = np.shape(log_factor)
+        batch_shape = jnp.shape(log_factor)
         event_shape = (0,)  # This satisfies .size == 0.
         self.log_factor = log_factor
         super(Unit, self).__init__(batch_shape, event_shape, validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
-        return np.empty(sample_shape + self.batch_shape + self.event_shape)
+        return jnp.empty(sample_shape + self.batch_shape + self.event_shape)
 
     def log_prob(self, value):
-        shape = lax.broadcast_shapes(self.batch_shape, np.shape(value)[:-1])
-        return np.broadcast_to(self.log_factor, shape)
+        shape = lax.broadcast_shapes(self.batch_shape, jnp.shape(value)[:-1])
+        return jnp.broadcast_to(self.log_factor, shape)

@@ -7,14 +7,14 @@ import os
 import random
 import re
 
-import numpy as onp
+import numpy as np
 import tqdm
 
 import jax
 from jax import device_put, jit, lax, ops, vmap
 from jax.core import Tracer
 from jax.dtypes import canonicalize_dtype
-import jax.numpy as np
+import jax.numpy as jnp
 from jax.tree_util import tree_flatten, tree_map, tree_unflatten
 
 _DATA_TYPES = {}
@@ -28,7 +28,7 @@ def set_rng_seed(rng_seed):
     :param int rng_seed: seed for Python and NumPy random states.
     """
     random.seed(rng_seed)
-    onp.random.seed(rng_seed)
+    np.random.seed(rng_seed)
 
 
 def enable_x64(use_x64=True):
@@ -140,7 +140,7 @@ def not_jax_tracer(x):
     return not isinstance(x, Tracer)
 
 
-def identity(x):
+def identity(x, *args, **kwargs):
     return x
 
 
@@ -206,11 +206,11 @@ def fori_collect(lower, upper, body_fun, init_val, transform=identity,
     def _body_fn(i, vals):
         val, collection, lower_idx = vals
         val = body_fun(val)
-        i = np.where(i >= lower_idx, i - lower_idx, 0)
+        i = jnp.where(i >= lower_idx, i - lower_idx, 0)
         collection = ops.index_update(collection, i, ravel_pytree(transform(val))[0])
         return val, collection, lower_idx
 
-    collection = np.zeros((collection_size,) + init_val_flat.shape)
+    collection = jnp.zeros((collection_size,) + init_val_flat.shape)
     if not progbar:
         last_val, collection, _ = fori_loop(0, upper, _body_fn, (init_val, collection, lower))
     else:
@@ -275,55 +275,53 @@ def copy_docs_from(source_class, full_text=False):
 
 pytree_metadata = namedtuple('pytree_metadata', ['flat', 'shape', 'event_size', 'dtype'])
 
-
 def _ravel_list(*leaves, batch_dims):
     leaves_metadata = tree_map(lambda l: pytree_metadata(
-        np.reshape(l, (*np.shape(l)[:batch_dims], -1)), np.shape(l), 
-        np.prod(np.shape(l)[batch_dims:], dtype='int32'), canonicalize_dtype(lax.dtype(l))), leaves)
-    leaves_idx = np.cumsum(np.array((0,) + tuple(d.event_size for d in leaves_metadata)))
+        jnp.reshape(l, (*jnp.shape(l)[:batch_dims], -1)), jnp.shape(l), 
+        jnp.prod(jnp.shape(l)[batch_dims:], dtype='int32'), canonicalize_dtype(lax.dtype(l))), leaves)
+    leaves_idx = jnp.cumsum(jnp.array((0,) + tuple(d.event_size for d in leaves_metadata)))
 
     def unravel_list(arr):
-        return [np.reshape(lax.dynamic_slice_in_dim(arr, leaves_idx[i], m.event_size),
-                           m.shape[batch_dims:]).astype(m.dtype)
+        return [jnp.reshape(lax.dynamic_slice_in_dim(arr, leaves_idx[i], m.event_size), 
+                            m.shape[batch_dims:]).astype(m.dtype)
                 for i, m in enumerate(leaves_metadata)]
 
-    def unravel_list_batched(arr):
-        return [np.reshape(lax.dynamic_slice_in_dim(arr, leaves_idx[i], m.event_size, axis=batch_dims),
-                           m.shape).astype(m.dtype)
-                for i, m in enumerate(leaves_metadata)]
-
-    flat = np.concatenate([m.flat for m in leaves_metadata], axis=-1) if leaves_metadata else np.array([])
-    return flat, unravel_list, unravel_list_batched
+    flat = jnp.concatenate([m.flat for m in leaves_metadata], axis=-1) if leaves_metadata else jnp.array([])
+    return flat, unravel_list
 
 
 def ravel_pytree(pytree, *, batch_dims=0):
     leaves, treedef = tree_flatten(pytree)
-    flat, unravel_list, unravel_list_batched = _ravel_list(*leaves, batch_dims=batch_dims)
+    flat, unravel_list = _ravel_list(*leaves, batch_dims=batch_dims)
 
     def unravel_pytree(arr):
         return tree_unflatten(treedef, unravel_list(arr))
 
-    def unravel_pytree_batched(arr):
-        return tree_unflatten(treedef, unravel_list_batched(arr))
+    return flat, unravel_pytree
 
-    if batch_dims > 0:
-        return flat, unravel_pytree, unravel_pytree_batched
-    else:
-        return flat, unravel_pytree
 
 def posdef(m):
-    mlambda, mvec = np.linalg.eigh(m)
-    if np.ndim(mlambda) >= 2:
-        mlambda = jax.vmap(lambda ml: np.diag(np.maximum(ml, 1e-5)), in_axes=tuple(range(np.ndim(mlambda) - 1)))(mlambda)
+    mlambda, mvec = jnp.linalg.eigh(m)
+    if jnp.ndim(mlambda) >= 2:
+        mlambda = jax.vmap(lambda ml: jnp.diag(jnp.maximum(ml, 1e-5)), in_axes=tuple(range(jnp.ndim(mlambda) - 1)))(mlambda)
     else:
-        mlambda = np.diag(np.maximum(mlambda, 1e-5))
-    return mvec @ mlambda @ np.swapaxes(mvec, -2, -1)
+        mlambda = jnp.diag(jnp.maximum(mlambda, 1e-5))
+    return mvec @ mlambda @ jnp.swapaxes(mvec, -2, -1)
 
 def sqrth(m):
-    mlambda, mvec = np.linalg.eigh(m)
-    if np.ndim(mlambda) >= 2:
-        mlambdasqrt = jax.vmap(lambda ml: np.diag(np.maximum(ml, 1e-5) ** 0.5), in_axes=tuple(range(np.ndim(mlambda) - 1)))(mlambda)
+    mlambda, mvec = jnp.linalg.eigh(m)
+    if jnp.ndim(mlambda) >= 2:
+        mlambdasqrt = jax.vmap(lambda ml: jnp.diag(jnp.maximum(ml, 1e-5) ** 0.5), in_axes=tuple(range(jnp.ndim(mlambda) - 1)))(mlambda)
     else:
-        mlambdasqrt = np.diag(np.maximum(mlambda, 1e-5) ** 0.5)
-    msqrt = mvec @ mlambdasqrt @ np.swapaxes(mvec, -2, -1)
+        mlambdasqrt = jnp.diag(jnp.maximum(mlambda, 1e-5) ** 0.5)
+    msqrt = mvec @ mlambdasqrt @ jnp.swapaxes(mvec, -2, -1)
     return msqrt
+
+def safe_norm(a, ord=2, axis=None):
+    if axis is not None:
+        is_zero = jnp.expand_dims(jnp.isclose(jnp.sum(a, axis=axis), 0.), axis=axis)
+    else:
+        is_zero = jnp.ones_like(a, dtype='bool')
+    norm = jnp.linalg.norm(a + jnp.where(is_zero, jnp.ones_like(a) * 1e-5 ** ord, jnp.zeros_like(a)), ord=ord, axis=axis)
+    return norm
+

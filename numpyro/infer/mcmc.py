@@ -9,20 +9,19 @@ from operator import attrgetter
 import os
 import warnings
 
-from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
+from jax import jit, lax, partial, pmap, random, vmap, device_put
 from jax.core import Tracer
 from jax.dtypes import canonicalize_dtype
 from jax.flatten_util import ravel_pytree
 from jax.interpreters.xla import DeviceArray
 from jax.lib import xla_bridge
-import jax.numpy as np
-from jax.random import PRNGKey
+import jax.numpy as jnp
 from jax.scipy.special import logsumexp
 from jax.tree_util import tree_flatten, tree_map, tree_multimap
 
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
-from numpyro.distributions.util import categorical_logits, cholesky_update
+from numpyro.distributions.util import cholesky_update
 from numpyro.infer.hmc_util import (
     IntegratorState,
     build_tree,
@@ -31,8 +30,8 @@ from numpyro.infer.hmc_util import (
     velocity_verlet,
     warmup_adapter
 )
-from numpyro.infer.util import init_to_uniform, get_potential_fn, find_valid_initial_params
-from numpyro.util import cond, copy_docs_from, fori_collect, fori_loop, identity, not_jax_tracer, cached_by
+from numpyro.infer.util import ParamInfo, init_to_uniform, initialize_model
+from numpyro.util import cond, copy_docs_from, fori_collect, fori_loop, identity, cached_by
 
 HMCState = namedtuple('HMCState', ['i', 'z', 'z_grad', 'potential_energy', 'energy', 'num_steps', 'accept_prob',
                                    'mean_accept_prob', 'diverging', 'adapt_state', 'rng_key'])
@@ -66,19 +65,20 @@ A :func:`~collections.namedtuple` consisting of the following fields:
 
 
 def _get_num_steps(step_size, trajectory_length):
-    num_steps = np.clip(trajectory_length / step_size, a_min=1)
-    # NB: casting to np.int64 does not take effect (returns np.int32 instead)
+    num_steps = jnp.clip(trajectory_length / step_size, a_min=1)
+    # NB: casting to jnp.int64 does not take effect (returns jnp.int32 instead)
     # if jax_enable_x64 is False
-    return num_steps.astype(canonicalize_dtype(np.int64))
+    return num_steps.astype(canonicalize_dtype(jnp.int64))
 
 
-def _sample_momentum(unpack_fn, mass_matrix_sqrt, rng_key):
-    eps = random.normal(rng_key, np.shape(mass_matrix_sqrt)[:1])
+def momentum_generator(prototype_r, mass_matrix_sqrt, rng_key):
+    _, unpack_fn = ravel_pytree(prototype_r)
+    eps = random.normal(rng_key, jnp.shape(mass_matrix_sqrt)[:1])
     if mass_matrix_sqrt.ndim == 1:
-        r = np.multiply(mass_matrix_sqrt, eps)
+        r = jnp.multiply(mass_matrix_sqrt, eps)
         return unpack_fn(r)
     elif mass_matrix_sqrt.ndim == 2:
-        r = np.dot(mass_matrix_sqrt, eps)
+        r = jnp.dot(mass_matrix_sqrt, eps)
         return unpack_fn(r)
     else:
         raise ValueError("Mass matrix has incorrect number of dims.")
@@ -141,33 +141,32 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
 
         >>> import jax
         >>> from jax import random
-        >>> import jax.numpy as np
+        >>> import jax.numpy as jnp
         >>> import numpyro
         >>> import numpyro.distributions as dist
         >>> from numpyro.infer.mcmc import hmc
         >>> from numpyro.infer.util import initialize_model
         >>> from numpyro.util import fori_collect
 
-        >>> true_coefs = np.array([1., 2., 3.])
+        >>> true_coefs = jnp.array([1., 2., 3.])
         >>> data = random.normal(random.PRNGKey(2), (2000, 3))
         >>> dim = 3
         >>> labels = dist.Bernoulli(logits=(true_coefs * data).sum(-1)).sample(random.PRNGKey(3))
         >>>
         >>> def model(data, labels):
-        ...     coefs_mean = np.zeros(dim)
-        ...     coefs = numpyro.sample('beta', dist.Normal(coefs_mean, np.ones(3)))
+        ...     coefs_mean = jnp.zeros(dim)
+        ...     coefs = numpyro.sample('beta', dist.Normal(coefs_mean, jnp.ones(3)))
         ...     intercept = numpyro.sample('intercept', dist.Normal(0., 10.))
         ...     return numpyro.sample('y', dist.Bernoulli(logits=(coefs * data + intercept).sum(-1)), obs=labels)
         >>>
-        >>> init_params, potential_fn, constrain_fn = initialize_model(random.PRNGKey(0),
-        ...                                                            model, model_args=(data, labels,))
-        >>> init_kernel, sample_kernel = hmc(potential_fn, algo='NUTS')
-        >>> hmc_state = init_kernel(init_params,
+        >>> model_info = initialize_model(random.PRNGKey(0), model, model_args=(data, labels,))
+        >>> init_kernel, sample_kernel = hmc(model_info.potential_fn, algo='NUTS')
+        >>> hmc_state = init_kernel(model_info.param_info,
         ...                         trajectory_length=10,
         ...                         num_warmup=300)
         >>> samples = fori_collect(0, 500, sample_kernel, hmc_state,
-        ...                        transform=lambda state: constrain_fn(state.z))
-        >>> print(np.mean(samples['beta'], axis=0))  # doctest: +SKIP
+        ...                        transform=lambda state: model_info.postprocess_fn(state.z))
+        >>> print(jnp.mean(samples['beta'], axis=0))  # doctest: +SKIP
         [0.9153987 2.0754058 2.9621222]
     """
     if kinetic_fn is None:
@@ -175,7 +174,6 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
     vv_update = None
     trajectory_len = None
     max_treedepth = None
-    momentum_generator = None
     wa_update = None
     wa_steps = None
     max_delta_energy = 1000.
@@ -195,7 +193,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
                     find_heuristic_step_size=False,
                     model_args=(),
                     model_kwargs=None,
-                    rng_key=PRNGKey(0)):
+                    rng_key=random.PRNGKey(0)):
         """
         Initializes the HMC sampler.
 
@@ -230,14 +228,15 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
             randomness.
 
         """
-        step_size = lax.convert_element_type(step_size, canonicalize_dtype(np.float64))
-        nonlocal momentum_generator, wa_update, trajectory_len, max_treedepth, vv_update, wa_steps
+        step_size = lax.convert_element_type(step_size, canonicalize_dtype(jnp.float64))
+        nonlocal wa_update, trajectory_len, max_treedepth, vv_update, wa_steps
         wa_steps = num_warmup
         trajectory_len = trajectory_length
         max_treedepth = max_tree_depth
-        z = init_params
-        z_flat, unravel_fn = ravel_pytree(z)
-        momentum_generator = partial(_sample_momentum, unravel_fn)
+        if isinstance(init_params, ParamInfo):
+            z, pe, z_grad = init_params
+        else:
+            z, pe, z_grad = init_params, None, None
         pe_fn = potential_fn
         if potential_fn_gen:
             if pe_fn is not None:
@@ -263,10 +262,10 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
         rng_key_hmc, rng_key_wa, rng_key_momentum = random.split(rng_key, 3)
         wa_state = wa_init(z, rng_key_wa, step_size,
                            inverse_mass_matrix=inverse_mass_matrix,
-                           mass_matrix_size=np.size(z_flat))
-        r = momentum_generator(wa_state.mass_matrix_sqrt, rng_key_momentum)
+                           mass_matrix_size=jnp.size(ravel_pytree(z)[0]))
+        r = momentum_generator(z, wa_state.mass_matrix_sqrt, rng_key_momentum)
         vv_init, vv_update = velocity_verlet(pe_fn, kinetic_fn)
-        vv_state = vv_init(z, r)
+        vv_state = vv_init(z, r, potential_energy=pe, z_grad=z_grad)
         energy = kinetic_fn(wa_state.inverse_mass_matrix, vv_state.r)
         hmc_state = HMCState(0, vv_state.z, vv_state.z_grad, vv_state.potential_energy, energy,
                              0, 0., 0., False, wa_state, rng_key_hmc)
@@ -286,13 +285,13 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
         energy_old = vv_state.potential_energy + kinetic_fn(inverse_mass_matrix, vv_state.r)
         energy_new = vv_state_new.potential_energy + kinetic_fn(inverse_mass_matrix, vv_state_new.r)
         delta_energy = energy_new - energy_old
-        delta_energy = np.where(np.isnan(delta_energy), np.inf, delta_energy)
-        accept_prob = np.clip(np.exp(-delta_energy), a_max=1.0)
+        delta_energy = jnp.where(jnp.isnan(delta_energy), jnp.inf, delta_energy)
+        accept_prob = jnp.clip(jnp.exp(-delta_energy), a_max=1.0)
         diverging = delta_energy > max_delta_energy
         transition = random.bernoulli(rng_key, accept_prob)
         vv_state, energy = cond(transition,
-                                (vv_state_new, energy_new), lambda args: args,
-                                (vv_state, energy_old), lambda args: args)
+                                (vv_state_new, energy_new), identity,
+                                (vv_state, energy_old), identity)
         return vv_state, energy, num_steps, accept_prob, diverging
 
     def _nuts_next(step_size, inverse_mass_matrix, vv_state,
@@ -330,7 +329,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
         """
         model_kwargs = {} if model_kwargs is None else model_kwargs
         rng_key, rng_key_momentum, rng_key_transition = random.split(hmc_state.rng_key, 3)
-        r = momentum_generator(hmc_state.adapt_state.mass_matrix_sqrt, rng_key_momentum)
+        r = momentum_generator(hmc_state.z, hmc_state.adapt_state.mass_matrix_sqrt, rng_key_momentum)
         vv_state = IntegratorState(hmc_state.z, r, hmc_state.potential_energy, hmc_state.z_grad)
         vv_state, energy, num_steps, accept_prob, diverging = _next(hmc_state.adapt_state.step_size,
                                                                     hmc_state.adapt_state.inverse_mass_matrix,
@@ -343,10 +342,10 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
                            (hmc_state.i, accept_prob, vv_state.z, hmc_state.adapt_state),
                            lambda args: wa_update(*args),
                            hmc_state.adapt_state,
-                           lambda x: x)
+                           identity)
 
         itr = hmc_state.i + 1
-        n = np.where(hmc_state.i < wa_steps, itr, itr - wa_steps)
+        n = jnp.where(hmc_state.i < wa_steps, itr, itr - wa_steps)
         mean_accept_prob = hmc_state.mean_accept_prob + (accept_prob - hmc_state.mean_accept_prob) / n
 
         return HMCState(itr, vv_state.z, vv_state.z_grad, vv_state.potential_energy, energy, num_steps,
@@ -457,7 +456,7 @@ class HMC(MCMCKernel):
                  dense_mass=False,
                  target_accept_prob=0.8,
                  trajectory_length=2 * math.pi,
-                 init_strategy=init_to_uniform(),
+                 init_strategy=init_to_uniform,
                  find_heuristic_step_size=False):
         if not (model is None) ^ (potential_fn is None):
             raise ValueError('Only one of `model` or `potential_fn` must be specified.')
@@ -479,21 +478,30 @@ class HMC(MCMCKernel):
         self._postprocess_fn = None
         self._sample_fn = None
 
-    def _init_state(self, rng_key, model_args, model_kwargs):
+    def _init_state(self, rng_key, model_args, model_kwargs, init_params):
         if self._model is not None:
-            potential_fn_gen, self._postprocess_fn = get_potential_fn(
+            init_params, potential_fn, postprocess_fn, model_trace = initialize_model(
                 rng_key,
                 self._model,
                 dynamic_args=True,
                 model_args=model_args,
                 model_kwargs=model_kwargs)
-            self._init_fn, self._sample_fn = hmc(potential_fn_gen=potential_fn_gen,
-                                                 kinetic_fn=self._kinetic_fn,
-                                                 algo=self._algo)
-        else:
+            if any(v['type'] == 'param' for v in model_trace.values()):
+                warnings.warn("'param' sites will be treated as constants during inference. To define "
+                              "an improper variable, please use a 'sample' site with log probability "
+                              "masked out. For example, `sample('x', dist.LogNormal(0, 1).mask(False)` "
+                              "means that `x` has improper distribution over the positive domain.")
+            if self._init_fn is None:
+                self._init_fn, self._sample_fn = hmc(potential_fn_gen=potential_fn,
+                                                     kinetic_fn=self._kinetic_fn,
+                                                     algo=self._algo)
+            self._postprocess_fn = postprocess_fn
+        elif self._init_fn is None:
             self._init_fn, self._sample_fn = hmc(potential_fn=self._potential_fn,
                                                  kinetic_fn=self._kinetic_fn,
                                                  algo=self._algo)
+
+        return init_params
 
     @property
     def model(self):
@@ -506,25 +514,11 @@ class HMC(MCMCKernel):
             rng_key, rng_key_init_model = random.split(rng_key)
         # vectorized
         else:
-            rng_key, rng_key_init_model = np.swapaxes(vmap(random.split)(rng_key), 0, 1)
-            # we need only a single key for initializing PE / constraints fn
-            rng_key_init_model = rng_key_init_model[0]
-        if not self._init_fn:
-            self._init_state(rng_key_init_model, model_args, model_kwargs)
+            rng_key, rng_key_init_model = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
+        init_params = self._init_state(rng_key_init_model, model_args, model_kwargs, init_params)
         if self._potential_fn and init_params is None:
             raise ValueError('Valid value of `init_params` must be provided with'
                              ' `potential_fn`.')
-        # Find valid initial params
-        if self._model and not init_params:
-            init_params, is_valid = find_valid_initial_params(rng_key, self._model,
-                                                              init_strategy=self._init_strategy,
-                                                              param_as_improper=True,
-                                                              model_args=model_args,
-                                                              model_kwargs=model_kwargs)
-            if not_jax_tracer(is_valid):
-                if device_get(~np.all(is_valid)):
-                    raise RuntimeError("Cannot find valid initial parameters. "
-                                       "Please check your model again.")
 
         hmc_init_fn = lambda init_params, rng_key: self._init_fn(  # noqa: E731
             init_params,
@@ -626,7 +620,7 @@ class NUTS(HMC):
                  target_accept_prob=0.8,
                  trajectory_length=None,
                  max_tree_depth=10,
-                 init_strategy=init_to_uniform(),
+                 init_strategy=init_to_uniform,
                  find_heuristic_step_size=False):
         super(NUTS, self).__init__(potential_fn=potential_fn, model=model, kinetic_fn=kinetic_fn,
                                    step_size=step_size, adapt_step_size=adapt_step_size,
@@ -650,21 +644,21 @@ def _get_proposal_loc_and_scale(samples, loc, scale, new_sample):
         proposal_scale = cholesky_update(new_scale, samples - loc, -weight)
         proposal_scale = cholesky_update(proposal_scale, new_sample - samples, - (weight ** 2))
     else:
-        var = np.square(scale) + weight * np.square(new_sample - loc)
-        proposal_var = var - weight * np.square(samples - loc)
-        proposal_var = proposal_var - weight ** 2 * np.square(new_sample - samples)
-        proposal_scale = np.sqrt(proposal_var)
+        var = jnp.square(scale) + weight * jnp.square(new_sample - loc)
+        proposal_var = var - weight * jnp.square(samples - loc)
+        proposal_var = proposal_var - weight ** 2 * jnp.square(new_sample - samples)
+        proposal_scale = jnp.sqrt(proposal_var)
 
     proposal_loc = loc + weight * (new_sample - samples)
     return proposal_loc, proposal_scale
 
 
 def _sample_proposal(inv_mass_matrix_sqrt, rng_key, batch_shape=()):
-    eps = random.normal(rng_key, batch_shape + np.shape(inv_mass_matrix_sqrt)[:1])
+    eps = random.normal(rng_key, batch_shape + jnp.shape(inv_mass_matrix_sqrt)[:1])
     if inv_mass_matrix_sqrt.ndim == 1:
-        r = np.multiply(inv_mass_matrix_sqrt, eps)
+        r = jnp.multiply(inv_mass_matrix_sqrt, eps)
     elif inv_mass_matrix_sqrt.ndim == 2:
-        r = np.matmul(inv_mass_matrix_sqrt, eps[..., None])[..., 0]
+        r = jnp.matmul(inv_mass_matrix_sqrt, eps[..., None])[..., 0]
     else:
         raise ValueError("Mass matrix has incorrect number of dims.")
     return r
@@ -708,8 +702,8 @@ def _numpy_delete(x, idx):
     Gets the subarray from `x` where data from index `idx` on the first axis is removed.
     """
     # NB: numpy.delete is not yet available in JAX
-    mask = np.arange(x.shape[0] - 1) < idx
-    return np.where(mask.reshape((-1,) + (1,) * (x.ndim - 1)), x[:-1], x[1:])
+    mask = jnp.arange(x.shape[0] - 1) < idx
+    return jnp.where(mask.reshape((-1,) + (1,) * (x.ndim - 1)), x[:-1], x[1:])
 
 
 # TODO: consider to expose this functional style
@@ -724,7 +718,7 @@ def _sa(potential_fn=None, potential_fn_gen=None):
                     dense_mass=False,
                     model_args=(),
                     model_kwargs=None,
-                    rng_key=PRNGKey(0)):
+                    rng_key=random.PRNGKey(0)):
         nonlocal wa_steps
         wa_steps = num_warmup
         pe_fn = potential_fn
@@ -738,9 +732,9 @@ def _sa(potential_fn=None, potential_fn_gen=None):
         z = init_params
         z_flat, unravel_fn = ravel_pytree(z)
         if inverse_mass_matrix is None:
-            inverse_mass_matrix = np.identity(z_flat.shape[-1]) if dense_mass else np.ones(z_flat.shape[-1])
-        inv_mass_matrix_sqrt = np.linalg.cholesky(inverse_mass_matrix) if dense_mass \
-            else np.sqrt(inverse_mass_matrix)
+            inverse_mass_matrix = jnp.identity(z_flat.shape[-1]) if dense_mass else jnp.ones(z_flat.shape[-1])
+        inv_mass_matrix_sqrt = jnp.linalg.cholesky(inverse_mass_matrix) if dense_mass \
+            else jnp.sqrt(inverse_mass_matrix)
         if adapt_state_size is None:
             # XXX: heuristic choice
             adapt_state_size = 2 * z_flat.shape[-1]
@@ -751,14 +745,14 @@ def _sa(potential_fn=None, potential_fn_gen=None):
         # compute potential energies
         pes = lax.map(lambda z: pe_fn(unravel_fn(z)), zs)
         if dense_mass:
-            cov = np.cov(zs, rowvar=False, bias=True)
+            cov = jnp.cov(zs, rowvar=False, bias=True)
             if cov.shape == ():  # JAX returns scalar for 1D input
                 cov = cov.reshape((1, 1))
-            inv_mass_matrix_sqrt = np.linalg.cholesky(cov)
+            inv_mass_matrix_sqrt = jnp.linalg.cholesky(cov)
         else:
-            inv_mass_matrix_sqrt = np.std(zs, 0)
-        adapt_state = SAAdaptState(zs, pes, np.mean(zs, 0), inv_mass_matrix_sqrt)
-        k = categorical_logits(rng_key_z, np.zeros(zs.shape[0]))
+            inv_mass_matrix_sqrt = jnp.std(zs, 0)
+        adapt_state = SAAdaptState(zs, pes, jnp.mean(zs, 0), inv_mass_matrix_sqrt)
+        k = random.categorical(rng_key_z, jnp.zeros(zs.shape[0]))
         z = unravel_fn(zs[k])
         pe = pes[k]
         sa_state = SAState(0, z, pe, 0., 0., False, adapt_state, rng_key_sa)
@@ -774,23 +768,23 @@ def _sa(potential_fn=None, potential_fn_gen=None):
 
         z = loc + _sample_proposal(scale, rng_key_z)
         pe = pe_fn(unravel_fn(z))
-        pe = np.where(np.isnan(pe), np.inf, pe)
+        pe = jnp.where(jnp.isnan(pe), jnp.inf, pe)
         diverging = (pe - sa_state.potential_energy) > max_delta_energy
 
         # NB: all terms having the pattern *s will have shape N x ...
         # and all terms having the pattern *s_ will have shape (N + 1) x ...
         locs, scales = _get_proposal_loc_and_scale(zs, loc, scale, z)
-        zs_ = np.concatenate([zs, z[None, :]])
-        pes_ = np.concatenate([pes, pe[None]])
-        locs_ = np.concatenate([locs, loc[None, :]])
-        scales_ = np.concatenate([scales, scale[None, ...]])
+        zs_ = jnp.concatenate([zs, z[None, :]])
+        pes_ = jnp.concatenate([pes, pe[None]])
+        locs_ = jnp.concatenate([locs, loc[None, :]])
+        scales_ = jnp.concatenate([scales, scale[None, ...]])
         if scale.ndim == 2:  # dense_mass
             log_weights_ = dist.MultivariateNormal(locs_, scale_tril=scales_).log_prob(zs_) + pes_
         else:
             log_weights_ = dist.Normal(locs_, scales_).log_prob(zs_).sum(-1) + pes_
-        log_weights_ = np.where(np.isnan(log_weights_), -np.inf, log_weights_)
+        log_weights_ = jnp.where(jnp.isnan(log_weights_), -jnp.inf, log_weights_)
         # get rejecting index
-        j = categorical_logits(rng_key_reject, log_weights_)
+        j = random.categorical(rng_key_reject, log_weights_)
         zs = _numpy_delete(zs_, j)
         pes = _numpy_delete(pes_, j)
         loc = locs_[j]
@@ -798,15 +792,15 @@ def _sa(potential_fn=None, potential_fn_gen=None):
         adapt_state = SAAdaptState(zs, pes, loc, scale)
 
         # NB: weights[-1] / sum(weights) is the probability of rejecting the new sample `z`.
-        accept_prob = 1 - np.exp(log_weights_[-1] - logsumexp(log_weights_))
+        accept_prob = 1 - jnp.exp(log_weights_[-1] - logsumexp(log_weights_))
         itr = sa_state.i + 1
-        n = np.where(sa_state.i < wa_steps, itr, itr - wa_steps)
+        n = jnp.where(sa_state.i < wa_steps, itr, itr - wa_steps)
         mean_accept_prob = sa_state.mean_accept_prob + (accept_prob - sa_state.mean_accept_prob) / n
 
         # XXX: we make a modification of SA sampler in [1]
         # in [1], each MCMC state contains N points `zs`
         # here we do resampling to pick randomly a point from those N points
-        k = categorical_logits(rng_key_accept, np.zeros(zs.shape[0]))
+        k = random.categorical(rng_key_accept, jnp.zeros(zs.shape[0]))
         z = unravel_fn(zs[k])
         pe = pes[k]
         return SAState(itr, z, pe, accept_prob, mean_accept_prob, diverging, adapt_state, rng_key)
@@ -849,7 +843,7 @@ class SA(MCMCKernel):
         See :ref:`init_strategy` section for available functions.
     """
     def __init__(self, model=None, potential_fn=None, adapt_state_size=None,
-                 dense_mass=True, init_strategy=init_to_uniform()):
+                 dense_mass=True, init_strategy=init_to_uniform):
         if not (model is None) ^ (potential_fn is None):
             raise ValueError('Only one of `model` or `potential_fn` must be specified.')
         self._model = model
@@ -861,18 +855,25 @@ class SA(MCMCKernel):
         self._postprocess_fn = None
         self._sample_fn = None
 
-    def _init_state(self, rng_key, model_args, model_kwargs):
+    def _init_state(self, rng_key, model_args, model_kwargs, init_params):
         if self._model is not None:
-            potential_fn_gen, self._postprocess_fn = get_potential_fn(
+            init_params, potential_fn, postprocess_fn, _ = initialize_model(
                 rng_key,
                 self._model,
                 dynamic_args=True,
                 model_args=model_args,
                 model_kwargs=model_kwargs)
+            init_params = init_params[0]
             # NB: init args is different from HMC
-            self._init_fn, self._sample_fn = _sa(potential_fn_gen=potential_fn_gen)
+            self._init_fn, sample_fn = _sa(potential_fn_gen=potential_fn)
+            if self._postprocess_fn is None:
+                self._postprocess_fn = postprocess_fn
         else:
-            self._init_fn, self._sample_fn = _sa(potential_fn=self._potential_fn)
+            self._init_fn, sample_fn = _sa(potential_fn=self._potential_fn)
+
+        if self._sample_fn is None:
+            self._sample_fn = sample_fn
+        return init_params
 
     @copy_docs_from(MCMCKernel.init)
     def init(self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}):
@@ -881,25 +882,13 @@ class SA(MCMCKernel):
             rng_key, rng_key_init_model = random.split(rng_key)
         # vectorized
         else:
-            rng_key, rng_key_init_model = np.swapaxes(vmap(random.split)(rng_key), 0, 1)
+            rng_key, rng_key_init_model = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
             # we need only a single key for initializing PE / constraints fn
             rng_key_init_model = rng_key_init_model[0]
-        if not self._init_fn:
-            self._init_state(rng_key_init_model, model_args, model_kwargs)
+        init_params = self._init_state(rng_key_init_model, model_args, model_kwargs, init_params)
         if self._potential_fn and init_params is None:
             raise ValueError('Valid value of `init_params` must be provided with'
                              ' `potential_fn`.')
-        # Find valid initial params
-        if self._model and not init_params:
-            init_params, is_valid = find_valid_initial_params(rng_key, self._model,
-                                                              init_strategy=self._init_strategy,
-                                                              param_as_improper=True,
-                                                              model_args=model_args,
-                                                              model_kwargs=model_kwargs)
-            if not_jax_tracer(is_valid):
-                if device_get(~np.all(is_valid)):
-                    raise RuntimeError("Cannot find valid initial parameters. "
-                                       "Please check your model again.")
 
         # NB: init args is different from HMC
         sa_init_fn = lambda init_params, rng_key: self._init_fn(  # noqa: E731
@@ -950,7 +939,7 @@ def _laxmap(f, xs):
         x = jit(_get_value_from_index)(xs, i)
         ys.append(f(x))
 
-    return tree_multimap(lambda *args: np.stack(args), *ys)
+    return tree_multimap(lambda *args: jnp.stack(args), *ys)
 
 
 def _sample_fn_jit_args(state, sampler):
@@ -978,7 +967,7 @@ def _hashable(x):
         return x
     elif isinstance(x, DeviceArray):
         return x.copy().tobytes()
-    elif isinstance(x, np.ndarray):
+    elif isinstance(x, jnp.ndarray):
         return x.tobytes()
     return x
 
@@ -1086,7 +1075,9 @@ class MCMC(object):
             init_state = self.sampler.init(rng_key, self.num_warmup, init_params,
                                            model_args=args, model_kwargs=kwargs)
         if self.postprocess_fn is None:
-            self.postprocess_fn = self.sampler.postprocess_fn(args, kwargs)
+            postprocess_fn = self.sampler.postprocess_fn(args, kwargs)
+        else:
+            postprocess_fn = self.postprocess_fn
         diagnostics = lambda x: get_diagnostics_str(x[0]) if rng_key.ndim == 1 else None   # noqa: E731
         init_val = (init_state, args, kwargs) if self._jit_model_args else (init_state,)
         lower_idx = self._collection_params["lower"]
@@ -1112,7 +1103,7 @@ class MCMC(object):
         # Apply constraints if number of samples is non-zero
         site_values = tree_flatten(states['z'])[0]
         if len(site_values) > 0 and site_values[0].size > 0:
-            states['z'] = lax.map(self.postprocess_fn, states['z'])
+            states['z'] = lax.map(postprocess_fn, states['z'])
         return states, last_state
 
     def _single_chain_jit_args(self, init, collect_fields=('z',)):
@@ -1182,6 +1173,11 @@ class MCMC(object):
             with the input type to `potential_fn`.
         :param kwargs: Keyword arguments to be provided to the :meth:`numpyro.infer.mcmc.MCMCKernel.init`
             method. These are typically the keyword arguments needed by the `model`.
+
+        .. note:: jax allows python code to continue even when the compiled code has not finished yet.
+            This can cause troubles when trying to profile the code for speed.
+            See https://jax.readthedocs.io/en/latest/async_dispatch.html and
+            https://jax.readthedocs.io/en/latest/profiling.html for pointers on profiling jax programs.
         """
         self._args = args
         self._kwargs = kwargs
@@ -1204,7 +1200,7 @@ class MCMC(object):
 
         if init_params is not None and self.num_chains > 1:
             prototype_init_val = tree_flatten(init_params)[0][0]
-            if np.shape(prototype_init_val)[0] != self.num_chains:
+            if jnp.shape(prototype_init_val)[0] != self.num_chains:
                 raise ValueError('`init_params` must have the same leading dimension'
                                  ' as `num_chains`.')
         assert isinstance(extra_fields, (tuple, list))
@@ -1212,7 +1208,7 @@ class MCMC(object):
         if self.num_chains == 1:
             states_flat, last_state = self._single_chain_mcmc(rng_key, init_state, init_params,
                                                               args, kwargs, collect_fields)
-            states = tree_map(lambda x: x[np.newaxis, ...], states_flat)
+            states = tree_map(lambda x: x[jnp.newaxis, ...], states_flat)
         else:
             if self._jit_model_args:
                 partial_map_fn = partial(self._single_chain_jit_args,
@@ -1240,8 +1236,8 @@ class MCMC(object):
                 states, last_state = map_fn((rng_key, init_state, init_params))
             if chain_method == 'vectorized':
                 # swap num_samples x num_chains to num_chains x num_samples
-                states = tree_map(lambda x: np.swapaxes(x, 0, 1), states)
-            states_flat = tree_map(lambda x: np.reshape(x, (-1,) + x.shape[2:]), states)
+                states = tree_map(lambda x: jnp.swapaxes(x, 0, 1), states)
+            states_flat = tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), states)
         self._last_state = last_state
         self._states = states
         self._states_flat = states_flat
@@ -1280,4 +1276,4 @@ class MCMC(object):
         print_summary(sites, prob=prob)
         extra_fields = self.get_extra_fields()
         if 'diverging' in extra_fields:
-            print("Number of divergences: {}".format(np.sum(extra_fields['diverging'])))
+            print("Number of divergences: {}".format(jnp.sum(extra_fields['diverging'])))

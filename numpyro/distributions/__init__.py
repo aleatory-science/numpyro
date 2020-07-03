@@ -16,6 +16,7 @@ from numpyro.distributions.continuous import (
     HalfCauchy,
     HalfNormal,
     InverseGamma,
+    Laplace,
     LKJCholesky,
     Logistic,
     LogNormal,
@@ -26,6 +27,7 @@ from numpyro.distributions.continuous import (
     StudentT,
     TruncatedCauchy,
     TruncatedNormal,
+    TruncatedPolyaGamma,
     Uniform
 )
 from numpyro.distributions.discrete import (
@@ -44,12 +46,13 @@ from numpyro.distributions.discrete import (
     MultinomialProbs,
     OrderedLogistic,
     Poisson,
-    PRNGIdentity,
     ZeroInflatedPoisson
 )
+from numpyro.distributions.directional import VonMises
 from numpyro.distributions.distribution import (
     Distribution,
     ExpandedDistribution,
+    ImproperUniform,
     Independent,
     MaskedDistribution,
     TransformedDistribution,
@@ -87,8 +90,10 @@ __all__ = [
     'Gumbel',
     'HalfCauchy',
     'HalfNormal',
+    'ImproperUniform',
     'Independent',
     'InverseGamma',
+    'Laplace',
     'LKJ',
     'LKJCholesky',
     'Logistic',
@@ -104,13 +109,13 @@ __all__ = [
     'OrderedLogistic',
     'Pareto',
     'Poisson',
-    'PRNGIdentity',
     'StudentT',
     'TransformedDistribution',
     'TruncatedCauchy',
     'TruncatedNormal',
+    'TruncatedPolyaGamma',
     'Uniform',
     'Unit',
-    'ZeroInflatedPoisson',
-
+    'VonMises',
+    'ZeroInflatedPoisson'
 ]

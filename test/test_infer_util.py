@@ -7,33 +7,36 @@ from numpy.testing import assert_allclose
 import pytest
 
 from jax import lax, random
-import jax.numpy as np
+import jax.numpy as jnp
 
 import numpyro
 from numpyro import handlers
 import numpyro.distributions as dist
-from numpyro.distributions import constraints, transforms
-from numpyro.distributions.transforms import biject_to
+from numpyro.distributions import constraints
+from numpyro.distributions.transforms import AffineTransform, biject_to
 from numpyro.infer import ELBO, MCMC, NUTS, SVI
-from numpyro.infer.util import (
-    Predictive,
-    constrain_fn,
+from numpyro.infer.initialization import (
     init_to_feasible,
     init_to_median,
     init_to_prior,
     init_to_uniform,
+    init_to_value,
+)
+from numpyro.infer.reparam import TransformReparam
+from numpyro.infer.util import (
+    Predictive,
+    constrain_fn,
     initialize_model,
     log_likelihood,
     potential_energy,
     transform_fn,
-    transformed_potential_energy
 )
 import numpyro.optim as optim
 
 
 def beta_bernoulli():
     N = 800
-    true_probs = np.array([0.2, 0.7])
+    true_probs = jnp.array([0.2, 0.7])
     data = dist.Bernoulli(true_probs).sample(random.PRNGKey(0), (N,))
 
     def model(data=None):
@@ -67,7 +70,7 @@ def test_predictive(parallel):
 
 
 def test_predictive_with_guide():
-    data = np.array([1] * 8 + [0] * 2)
+    data = jnp.array([1] * 8 + [0] * 2)
 
     def model(data):
         f = numpyro.sample("beta", dist.Beta(1., 1.))
@@ -94,7 +97,7 @@ def test_predictive_with_guide():
     predictive = Predictive(model, guide=guide, params=params, num_samples=1000)(random.PRNGKey(2), data=None)
     assert predictive["beta_sq"].shape == (1000,)
     obs_pred = predictive["obs"]
-    assert_allclose(np.mean(obs_pred), 0.8, atol=0.05)
+    assert_allclose(jnp.mean(obs_pred), 0.8, atol=0.05)
 
 
 def test_predictive_with_improper():
@@ -102,7 +105,10 @@ def test_predictive_with_improper():
 
     def model(data):
         alpha = numpyro.sample('alpha', dist.Uniform(0, 1))
-        loc = numpyro.param('loc', 0., constraint=constraints.interval(0., alpha))
+        with handlers.reparam(config={'loc': TransformReparam()}):
+            loc = numpyro.sample('loc', dist.TransformedDistribution(
+                dist.Uniform(0, 1).mask(False),
+                AffineTransform(0, alpha)))
         numpyro.sample('obs', dist.Normal(loc, 0.1), obs=data)
 
     data = true_coef + random.normal(random.PRNGKey(0), (1000,))
@@ -111,7 +117,7 @@ def test_predictive_with_improper():
     mcmc.run(random.PRNGKey(0), data)
     samples = mcmc.get_samples()
     obs_pred = Predictive(model, samples)(random.PRNGKey(1), data=None)["obs"]
-    assert_allclose(np.mean(obs_pred), true_coef, atol=0.05)
+    assert_allclose(jnp.mean(obs_pred), true_coef, atol=0.05)
 
 
 def test_prior_predictive():
@@ -134,18 +140,6 @@ def test_log_likelihood():
     assert_allclose(loglik["obs"], dist.Bernoulli(samples["beta"].reshape((100, 1, -1))).log_prob(data))
 
 
-def test_transformed_potential_energy():
-    beta_dist = dist.Beta(np.ones(5), np.ones(5))
-    transform = transforms.AffineTransform(3, 4)
-    inv_transform = transforms.AffineTransform(-0.75, 0.25)
-
-    z = random.normal(random.PRNGKey(0), (5,))
-    pe_expected = -dist.TransformedDistribution(beta_dist, transform).log_prob(z)
-    potential_fn = lambda x: -beta_dist.log_prob(x)  # noqa: E731
-    pe_actual = transformed_potential_energy(potential_fn, inv_transform, z)
-    assert_allclose(pe_actual, pe_expected)
-
-
 def test_model_with_transformed_distribution():
     x_prior = dist.HalfNormal(2)
     y_prior = dist.LogNormal(scale=3.)  # transformed distribution
@@ -154,7 +148,7 @@ def test_model_with_transformed_distribution():
         numpyro.sample('x', x_prior)
         numpyro.sample('y', y_prior)
 
-    params = {'x': np.array(-5.), 'y': np.array(7.)}
+    params = {'x': jnp.array(-5.), 'y': jnp.array(7.)}
     model = handlers.seed(model, random.PRNGKey(0))
     inv_transforms = {'x': biject_to(x_prior.support), 'y': biject_to(y_prior.support)}
     expected_samples = partial(transform_fn, inv_transforms)(params)
@@ -165,10 +159,12 @@ def test_model_with_transformed_distribution():
         inv_transforms['y'].log_abs_det_jacobian(params['y'], expected_samples['y'])
     )
 
-    base_inv_transforms = {'x': biject_to(x_prior.support), 'y': biject_to(y_prior.base_dist.support)}
+    reparam_model = handlers.reparam(model, {'y': TransformReparam()})
+    base_params = {'x': params['x'], 'y_base': params['y']}
     actual_samples = constrain_fn(
-        handlers.seed(model, random.PRNGKey(0)), base_inv_transforms,  (), {}, params)
-    actual_potential_energy = potential_energy(model, base_inv_transforms, (), {}, params)
+        handlers.seed(reparam_model, random.PRNGKey(0)),
+        (), {}, base_params, return_deterministic=True)
+    actual_potential_energy = potential_energy(reparam_model, (), {}, base_params)
 
     assert_allclose(expected_samples['x'], actual_samples['x'])
     assert_allclose(expected_samples['y'], actual_samples['y'])
@@ -191,18 +187,24 @@ def test_model_with_mask_false():
     init_to_feasible(),
     init_to_median(num_samples=2),
     init_to_prior(),
-    init_to_uniform(),
+    init_to_uniform(radius=3),
+    init_to_value(values={'tau': 0.7}),
+    init_to_feasible,
+    init_to_median,
+    init_to_prior,
+    init_to_uniform,
+    init_to_value,
 ])
 def test_initialize_model_change_point(init_strategy):
     def model(data):
-        alpha = 1 / np.mean(data)
+        alpha = 1 / jnp.mean(data)
         lambda1 = numpyro.sample('lambda1', dist.Exponential(alpha))
         lambda2 = numpyro.sample('lambda2', dist.Exponential(alpha))
         tau = numpyro.sample('tau', dist.Uniform(0, 1))
-        lambda12 = np.where(np.arange(len(data)) < tau * len(data), lambda1, lambda2)
+        lambda12 = jnp.where(jnp.arange(len(data)) < tau * len(data), lambda1, lambda2)
         numpyro.sample('obs', dist.Poisson(lambda12), obs=data)
 
-    count_data = np.array([
+    count_data = jnp.array([
         13,  24,   8,  24,   7,  35,  14,  11,  15,  11,  22,  22,  11,  57,
         11,  19,  29,   6,  19,  12,  22,  12,  18,  72,  32,   9,   7,  13,
         19,  23,  27,  20,   6,  17,  13,  10,  14,   6,  16,  15,   7,   2,
@@ -212,16 +214,16 @@ def test_initialize_model_change_point(init_strategy):
     ])
 
     rng_keys = random.split(random.PRNGKey(1), 2)
-    init_params, _, _ = initialize_model(rng_keys, model,
-                                         init_strategy=init_strategy,
-                                         model_args=(count_data,))
+    init_params, _, _, _ = initialize_model(rng_keys, model,
+                                            init_strategy=init_strategy,
+                                            model_args=(count_data,))
     for i in range(2):
-        init_params_i, _, _ = initialize_model(rng_keys[i], model,
-                                               init_strategy=init_strategy,
-                                               model_args=(count_data,))
-        for name, p in init_params.items():
+        init_params_i, _, _, _ = initialize_model(rng_keys[i], model,
+                                                  init_strategy=init_strategy,
+                                                  model_args=(count_data,))
+        for name, p in init_params[0].items():
             # XXX: the result is equal if we disable fast-math-mode
-            assert_allclose(p[i], init_params_i[name], atol=1e-6)
+            assert_allclose(p[i], init_params_i[0][name], atol=1e-6)
 
 
 @pytest.mark.parametrize('init_strategy', [
@@ -232,22 +234,38 @@ def test_initialize_model_change_point(init_strategy):
 ])
 def test_initialize_model_dirichlet_categorical(init_strategy):
     def model(data):
-        concentration = np.array([1.0, 1.0, 1.0])
+        concentration = jnp.array([1.0, 1.0, 1.0])
         p_latent = numpyro.sample('p_latent', dist.Dirichlet(concentration))
         numpyro.sample('obs', dist.Categorical(p_latent), obs=data)
         return p_latent
 
-    true_probs = np.array([0.1, 0.6, 0.3])
+    true_probs = jnp.array([0.1, 0.6, 0.3])
     data = dist.Categorical(true_probs).sample(random.PRNGKey(1), (2000,))
 
     rng_keys = random.split(random.PRNGKey(1), 2)
-    init_params, _, _ = initialize_model(rng_keys, model,
-                                         init_strategy=init_strategy,
-                                         model_args=(data,))
+    init_params, _, _, _ = initialize_model(rng_keys, model,
+                                            init_strategy=init_strategy,
+                                            model_args=(data,))
     for i in range(2):
-        init_params_i, _, _ = initialize_model(rng_keys[i], model,
-                                               init_strategy=init_strategy,
-                                               model_args=(data,))
-        for name, p in init_params.items():
+        init_params_i, _, _, _ = initialize_model(rng_keys[i], model,
+                                                  init_strategy=init_strategy,
+                                                  model_args=(data,))
+        for name, p in init_params[0].items():
             # XXX: the result is equal if we disable fast-math-mode
-            assert_allclose(p[i], init_params_i[name], atol=1e-6)
+            assert_allclose(p[i], init_params_i[0][name], atol=1e-6)
+
+
+@pytest.mark.parametrize('event_shape', [(3,), ()])
+def test_improper_expand(event_shape):
+
+    def model():
+        population = jnp.array([1000., 2000., 3000.])
+        with numpyro.plate("region", 3):
+            d = dist.ImproperUniform(support=constraints.interval(0, population),
+                                     batch_shape=(3,),
+                                     event_shape=event_shape)
+            incidence = numpyro.sample("incidence", d)
+            assert d.log_prob(incidence).shape == (3,)
+
+    model_info = initialize_model(random.PRNGKey(0), model)
+    assert model_info.param_info.z['incidence'].shape == (3,) + event_shape

@@ -3,46 +3,37 @@ import bz2
 import pathlib
 import time
 from datetime import datetime
-from functools import namedtuple
+from functools import namedtuple, partial
 from typing import Callable
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random
-import tqdm
 from jax import ops
 from jax.tree_util import tree_map
 
 from numpyro import handlers
 from numpyro.distributions import constraints
-from numpyro.distributions.transforms import biject_to
-from numpyro.guides import ReinitGuide
-from numpyro.infer import NUTS, MCMC
+from numpyro.distributions.transforms import biject_to, IdentityTransform
+from numpyro.infer import NUTS, MCMC, VI
+from numpyro.infer.guide import ReinitGuide
 from numpyro.infer.kernels import SteinKernel
-from numpyro.infer.util import transform_fn
-from numpyro.util import fori_loop, ravel_pytree
+from numpyro.infer.util import transform_fn, get_parameter_transform
+from numpyro.util import ravel_pytree
 
 # TODO
 # Fix MCMC updates to work reasonably with optimizer
 
-SVGDState = namedtuple('SVGDState', ['optim_state', 'rng_key'])
+SteinState = namedtuple('SteinState', ['optim_state', 'rng_key'])
 
 
 # Lots of code based on SVI interface and commonalities should be refactored
-class SVGD:
-    STRFTIME = "%H%M%S_%d%m%Y"
-    STATE_FILE = 'state.pbz2'
-    TRANSFORMS_FILE = 'transforms.pbz2'
-    INV_TRANSFORMS_FILE = 'inv_transforms.pbz2'
-    GUIDE_PARAM_NAMES_FILE = 'guide_param_names.pbz2'
-
-    def __init__(self, model, guide: ReinitGuide, optim, loss, kernel_fn: SteinKernel,
-                 num_particles: int = 10, loss_temperature: float = 1.0, repulsion_temperature: float = 1.0,
-                 classic_guide_params_fn: Callable[[str], bool] = lambda name: False,
-                 sp_mcmc_crit='infl', sp_mode='local',
-                 num_mcmc_particles: int = 0, num_mcmc_warmup: int = 100, num_mcmc_updates: int = 10,
-                 sampler_fn=NUTS, sampler_kwargs=None, mcmc_kwargs=None, checkpoint_dir_path='checkpoints',
-                 **static_kwargs):
+class Stein(VI):
+    def __init__(self, model, guide: ReinitGuide, optim, loss, kernel_fn: SteinKernel, num_particles: int = 10,
+                 loss_temperature: float = 1.0, repulsion_temperature: float = 1.0,
+                 classic_guide_params_fn: Callable[[str], bool] = lambda name: False, sp_mcmc_crit='infl',
+                 sp_mode='local', num_mcmc_particles: int = 0, num_mcmc_warmup: int = 100, num_mcmc_updates: int = 10,
+                 sampler_fn=NUTS, sampler_kwargs=None, mcmc_kwargs=None, **static_kwargs):
         """
         Stein Variational Gradient Descent for Non-parametric Inference.
         :param model: Python callable with Pyro primitives for the model.
@@ -54,21 +45,21 @@ class SVGD:
         :param num_particles: number of particles for Stein inference.
             (More particles capture more of the posterior distribution)
         :param loss_temperature: scaling of loss factor
-        :param repulsion_temperature: scaling of repulsive forces (Non-linear SVGD)
+        :param repulsion_temperature: scaling of repulsive forces (Non-linear Stein)
         :param classic_guide_param_fn: predicate on names of parameters in guide which should be optimized classically without Stein
                 (E.g., parameters for large normal networks or other transformation)
-        :param sp_mcmc_crit: Stein Point MCMC update selection criterion, either 'infl' for most influential or 'rand' for random
-        :param sp_mode: Stein Point MCMC mode for calculating Kernelized Stein Discrepancy. Either 'local' for only the updated MCMC particles or 'global' for all particles.
-        :param num_mcmc_particles: Number of particles that should be updated with Stein Point MCMC (should be a subset of number of Stein particles)
-        :param num_mcmc_warmup: Number of warmup steps for the MCMC sampler
-        :param num_mcmc_updates: Number of MCMC update steps at each iteration
-        :param sampler_fn: The MCMC sampling kernel used for the Stein Point MCMC updates
-        :param sampler_kwargs: Keyword arguments provided to the MCMC sampling kernel
-        :param mcmc_kwargs: Keyword arguments provided to the MCMC interface
-        :param checkpoint_dir_path: path to checkout directory
+        :param sp_mcmc_crit: Stein Point MCMC update selection criterion, either 'infl' for most influential or 'rand' for random (EXPERIMENTAL)
+        :param sp_mode: Stein Point MCMC mode for calculating Kernelized Stein Discrepancy. Either 'local' for only the updated MCMC particles or 'global' for all particles. (EXPERIMENTAL)
+        :param num_mcmc_particles: Number of particles that should be updated with Stein Point MCMC (should be a subset of number of Stein particles) (EXPERIMENTAL)
+        :param num_mcmc_warmup: Number of warmup steps for the MCMC sampler (EXPERIMENTAL)
+        :param num_mcmc_updates: Number of MCMC update steps at each iteration (EXPERIMENTAL)
+        :param sampler_fn: The MCMC sampling kernel used for the Stein Point MCMC updates (EXPERIMENTAL)
+        :param sampler_kwargs: Keyword arguments provided to the MCMC sampling kernel (EXPERIMENTAL)
+        :param mcmc_kwargs: Keyword arguments provided to the MCMC interface (EXPERIMENTAL)
         :param static_kwargs: Static keyword arguments for the model / guide, i.e. arguments
             that remain constant during fitting.
         """
+        super().__init__(model, guide, optim, loss, name='Stein', **static_kwargs)
         assert sp_mcmc_crit == 'infl' or sp_mcmc_crit == 'rand'
         assert sp_mode == 'local' or sp_mode == 'global'
         assert 0 <= num_mcmc_particles <= num_particles
@@ -91,13 +82,11 @@ class SVGD:
         self.sampler_fn = sampler_fn
         self.sampler_kwargs = sampler_kwargs or dict()
         self.mcmc_kwargs = mcmc_kwargs or dict()
-        self.checkpoint_dir_path = pathlib.Path(pathlib.Path(checkpoint_dir_path).absolute())
         self.mcmc: MCMC = None
         self.guide_param_names = None
         self.constrain_fn = None
         self.uconstrain_fn = None
-        self.transform = None
-        self.inv_transform = None
+        self.particle_transform_fn = None
 
     def _apply_kernel(self, kernel, x, y, v):
         if self.kernel_fn.mode == 'norm' or self.kernel_fn.mode == 'vector':
@@ -109,10 +98,10 @@ class SVGD:
         if self.kernel_fn.mode == 'norm':
             return jax.grad(lambda x: kernel(x, y))(x)
         elif self.kernel_fn.mode == 'vector':
-            return jax.vmap(lambda i: jax.grad(lambda xi: kernel(xi, y[i])[i])(x[i]))(np.arange(x.shape[0]))
+            return jax.vmap(lambda i: jax.grad(lambda x: kernel(x, y)[i])(x)[i])(jnp.arange(x.shape[0]))
         else:
-            return jax.vmap(lambda l: np.sum(jax.vmap(lambda m: jax.grad(lambda x: kernel(x, y)[l, m])(x)[m])
-                                             (np.arange(x.shape[0]))))(np.arange(x.shape[0]))
+            return jax.vmap(lambda l: jnp.sum(jax.vmap(lambda m: jax.grad(lambda x: kernel(x, y)[l, m])(x)[m])
+                                              (jnp.arange(x.shape[0]))))(jnp.arange(x.shape[0]))
 
     def _param_size(self, param):
         if isinstance(param, tuple) or isinstance(param, list):
@@ -135,8 +124,10 @@ class SVGD:
         classic_uparams = {p: v for p, v in unconstr_params.items() if
                            p not in self.guide_param_names or self.classic_guide_params_fn(p)}
         stein_uparams = {p: v for p, v in unconstr_params.items() if p not in classic_uparams}
-        # 1. Collect each guide parameter into monolithic particles that capture correlations between parameter values across each individual particle
-        stein_particles, unravel_pytree, unravel_pytree_batched = ravel_pytree(stein_uparams, batch_dims=1)
+        # 1. Collect each guide parameter into monolithic particles that capture correlations
+        # between parameter values across each individual particle
+        stein_particles, unravel_pytree = ravel_pytree(stein_uparams, batch_dims=1)
+        unravel_pytree_batched = jax.vmap(unravel_pytree)
         particle_info = self._calc_particle_info(stein_uparams, stein_particles.shape[0])
 
         # 2. Calculate loss and gradients for each parameter
@@ -153,17 +144,26 @@ class SVGD:
                                                            scaled_loss(rng_key, self.constrain_fn(cps),
                                                                        self.constrain_fn(unravel_pytree(ps))))(
             classic_uparams))(stein_particles)
-        classic_param_grads = tree_map(jax.partial(np.mean, axis=0), classic_param_grads)
+        classic_param_grads = tree_map(partial(jnp.mean, axis=0), classic_param_grads)
+
+        def particle_transform_fn(particle):
+            params = unravel_pytree(particle)
+            tparams = self.particle_transform_fn(params)
+            tparticle, _ = ravel_pytree(tparams)
+            # TODO: Figure out what to do with transformations that are not shape preserving
+            assert particle.shape == tparticle.shape
+            return tparticle
 
         # 3. Calculate kernel on monolithic particle
-        kernel = self.kernel_fn.compute(stein_particles, particle_info, kernel_particle_loss_fn)
+        kernel = self.kernel_fn.compute(stein_particles, particle_info, kernel_particle_loss_fn,
+                                        particle_transform_fn)
 
         # 4. Calculate the attractive force and repulsive force on the monolithic particles
-        attractive_force = jax.vmap(lambda y: np.sum(
+        attractive_force = jax.vmap(lambda y: jnp.sum(
             jax.vmap(lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad))(stein_particles,
                                                                                          particle_ljp_grads), axis=0))(
             stein_particles)
-        repulsive_force = jax.vmap(lambda y: np.sum(
+        repulsive_force = jax.vmap(lambda y: jnp.sum(
             jax.vmap(lambda x: self.repulsion_temperature * self._kernel_grad(kernel, x, y))(stein_particles), axis=0))(
             stein_particles)
         particle_grads = (attractive_force + repulsive_force) / self.num_particles
@@ -173,7 +173,7 @@ class SVGD:
 
         # 6. Return loss and gradients (based on parameter forces)
         res_grads = tree_map(lambda x: -x, {**classic_param_grads, **stein_param_grads})
-        return -np.mean(loss), res_grads
+        return -jnp.mean(loss), res_grads
 
     def _score_sp_mcmc(self, rng_key, subset_idxs, stein_uparams, sp_mcmc_subset_uparams, classic_uparams,
                        *args, **kwargs):
@@ -183,7 +183,7 @@ class SVGD:
             stein_uparams = {p: ops.index_update(v, subset_idxs, sp_mcmc_subset_uparams[p]) for p, v in
                              stein_uparams.items()}
             _, ksd = self._svgd_loss_and_grads(rng_key, {**stein_uparams, **classic_uparams}, *args, **kwargs)
-        ksd_res = np.sum(np.concatenate([np.ravel(v) for v in ksd.values()]))
+        ksd_res = jnp.sum(jnp.concatenate([jnp.ravel(v) for v in ksd.values()]))
         return ksd_res
 
     def _sp_mcmc(self, rng_key, unconstr_params, *args, **kwargs):
@@ -207,17 +207,17 @@ class SVGD:
         # 2. Choose MCMC particles
         mcmc_key, choice_key = jax.random.split(mcmc_key)
         if self.num_mcmc_particles == self.num_particles:
-            idxs = np.arange(self.num_particles)
+            idxs = jnp.arange(self.num_particles)
         else:
             if self.sp_mcmc_crit == 'rand':
-                idxs = jax.random.shuffle(choice_key, np.arange(self.num_particles))[:self.num_mcmc_particles]
+                idxs = jax.random.shuffle(choice_key, jnp.arange(self.num_particles))[:self.num_mcmc_particles]
             elif self.sp_mcmc_crit == 'infl':
                 _, grads = self._svgd_loss_and_grads(choice_key, unconstr_params, *args, **kwargs)
-                ksd = np.linalg.norm(
-                    np.concatenate([np.reshape(grads[p], (self.num_particles, -1)) for p in stein_uparams.keys()],
-                                   axis=-1),
+                ksd = jnp.linalg.norm(
+                    jnp.concatenate([jnp.reshape(grads[p], (self.num_particles, -1)) for p in stein_uparams.keys()],
+                                    axis=-1),
                     ord=2, axis=-1)
-                idxs = np.argsort(ksd)[:self.num_mcmc_particles]
+                idxs = jnp.argsort(ksd)[:self.num_mcmc_particles]
             else:
                 assert False, "Unsupported SP MCMC criterion: {}".format(self.sp_mcmc_crit)
 
@@ -231,8 +231,8 @@ class SVGD:
         # 4. Select best MCMC iteration to update particles
         scores = jax.vmap(
             lambda i: self._score_sp_mcmc(mcmc_key, idxs, stein_uparams, {p: v[:, i] for p, v in sss_uparams.items()},
-                                          classic_uparams, *args, **kwargs))(np.arange(self.num_mcmc_particles))
-        mcmc_idx = np.argmax(scores)
+                                          classic_uparams, *args, **kwargs))(jnp.arange(self.num_mcmc_particles))
+        mcmc_idx = jnp.argmax(scores)
         stein_uparams = {p: ops.index_update(v, idxs, sss_uparams[p][:, mcmc_idx]) for p, v in stein_uparams.items()}
         return {**stein_uparams, **classic_uparams}
 
@@ -243,7 +243,7 @@ class SVGD:
             the course of fitting).
         :param kwargs: keyword arguments to the model / guide (these can possibly vary
             during the course of fitting).
-        :return: initial :data:`SVGDState`
+        :return: initial :data:`SteinState`
         """
         rng_key, model_seed, guide_seed = jax.random.split(rng_key, 3)
         model_init = handlers.seed(self.model, model_seed)
@@ -258,14 +258,15 @@ class SVGD:
         params = {}
         transforms = {}
         inv_transforms = {}
+        particle_transforms = {}
         guide_param_names = set()
         # NB: params in model_trace will be overwritten by params in guide_trace
         for site in list(model_trace.values()) + list(guide_trace.values()):
             if site['type'] == 'param':
-                constraint = site['kwargs'].pop('constraint', constraints.real)
-                transform = biject_to(constraint)
+                transform = get_parameter_transform(site)
                 inv_transforms[site['name']] = transform
                 transforms[site['name']] = transform.inv
+                particle_transforms[site['name']] = site.get('particle_transform', IdentityTransform())
                 if site['name'] in guide_init_params:
                     pval, _ = guide_init_params[site['name']]
                     if self.classic_guide_params_fn(site['name']):
@@ -276,16 +277,11 @@ class SVGD:
                 if site['name'] in guide_trace:
                     guide_param_names.add(site['name'])
 
-        self._set_model_guide_attrs(guide_param_names, transforms, inv_transforms)
-
-        return SVGDState(self.optim.init(params), rng_key)
-
-    def _set_model_guide_attrs(self, guide_param_names, transforms, inv_transforms):
         self.guide_param_names = guide_param_names
-        self.transforms = transforms
-        self.inv_transforms = inv_transforms
-        self.constrain_fn = jax.partial(transform_fn, inv_transforms)
-        self.uconstrain_fn = jax.partial(transform_fn, transforms)
+        self.constrain_fn = partial(transform_fn, inv_transforms)
+        self.uconstrain_fn = partial(transform_fn, transforms)
+        self.particle_transform_fn = partial(transform_fn, particle_transforms)
+        return SteinState(self.optim.init(params), rng_key)
 
     def get_params(self, state):
         """
@@ -295,65 +291,11 @@ class SVGD:
         params = self.constrain_fn(self.optim.get_params(state.optim_state))
         return params
 
-    def store_checkout(self, state):
-        """
-        Create checkpoint with current state of optimizer.
-
-        :param state: current state of the optimizer.
-        """
-        ch_dir = self.checkpoint_dir_path
-        ch_dir.mkdir(exist_ok=True)
-
-        ts = datetime.utcnow().strftime(SVGD.STRFTIME)
-        (ch_dir / ts).mkdir()
-
-        with bz2.open(ch_dir / ts / SVGD.STATE_FILE, 'w') as f:
-            c_pickle.dump(self.get_params(state), f)
-        with bz2.open(ch_dir / ts / SVGD.TRANSFORMS_FILE, 'w') as f:
-            c_pickle.dump(self.transforms, f)
-        with bz2.open(ch_dir / ts / SVGD.INV_TRANSFORMS_FILE, 'w') as f:
-            c_pickle.dump(self.inv_transforms, f)
-        with bz2.open(ch_dir / ts / SVGD.GUIDE_PARAM_NAMES_FILE, 'w') as f:
-            c_pickle.dump(self.guide_param_names, f)
-
-        print(f"Checkpoint at {ts} created!")
-
-    def load_latest_checkout(self, rng_key):
-        """
-        Restore current state of optimization for latest checkpoint.
-
-        :param rng_key: current state of the optimizer.
-        """
-        checkpoints = list(self.checkpoint_dir_path.iterdir())
-        assert checkpoints, 'No checkpoints available!'
-
-        checkpoints.sort(key=lambda ts: time.mktime(time.strptime(ts.name, SVGD.STRFTIME)), reverse=True)
-        latest = checkpoints[0]
-
-        with bz2.BZ2File(latest / SVGD.STATE_FILE) as f:
-            raw_state = c_pickle.load(f)
-            state = SVGDState(self.optim.init(raw_state), rng_key)
-
-        with bz2.BZ2File(latest / SVGD.TRANSFORMS_FILE) as f:
-            transforms = c_pickle.load(f)
-
-        with bz2.BZ2File(latest / SVGD.INV_TRANSFORMS_FILE) as f:
-            inv_transforms = c_pickle.load(f)
-
-        with bz2.BZ2File(latest / SVGD.GUIDE_PARAM_NAMES_FILE) as f:
-            guide_param_names = c_pickle.load(f)
-
-        print(f"Loaded checkpoint from {latest.name}!")
-
-        self._set_model_guide_attrs(guide_param_names, transforms, inv_transforms)
-
-        return state
-
     def update(self, state, *args, **kwargs):
         """
-        Take a single step of SVGD (possibly on a batch / minibatch of data),
+        Take a single step of Stein (possibly on a batch / minibatch of data),
         using the optimizer.
-        :param state: current state of SVGD.
+        :param state: current state of Stein.
         :param args: arguments to the model / guide (these can possibly vary during
             the course of fitting).
         :param kwargs: keyword arguments to the model / guide (these can possibly vary
@@ -373,33 +315,12 @@ class SVGD:
         loss_val, grads = self._svgd_loss_and_grads(rng_key_step, params,
                                                     *args, **kwargs, **self.static_kwargs)
         optim_state = self.optim.update(grads, optim_state)
-        return SVGDState(optim_state, rng_key), loss_val
-
-    def run(self, rng_key, num_steps, *args, return_last=True, progbar=True, **kwargs):
-        def bodyfn(i, info):
-            svgd_state, losses = info
-            svgd_state, loss = self.update(svgd_state, *args, **kwargs)
-            losses = ops.index_update(losses, i, loss)
-            return svgd_state, losses
-
-        svgd_state = self.init(rng_key, *args, **kwargs)
-        losses = np.empty((num_steps,))
-        if not progbar:
-            svgd_state, losses = fori_loop(0, num_steps, bodyfn, (svgd_state, losses))
-        else:
-            bodyfn = jax.jit(bodyfn)
-            with tqdm.trange(num_steps) as t:
-                for i in t:
-                    svgd_state, losses = bodyfn(i, (svgd_state, losses))
-                    t.set_description('SVGD {:.5}'.format(losses[i]), refresh=False)
-                    t.update()
-        loss_res = losses[-1] if return_last else losses
-        return svgd_state, loss_res
+        return SteinState(optim_state, rng_key), loss_val
 
     def evaluate(self, state, *args, **kwargs):
         """
-        Take a single step of SVGD (possibly on a batch / minibatch of data).
-        :param state: current state of SVGD.
+        Take a single step of Stein (possibly on a batch / minibatch of data).
+        :param state: current state of Stein.
         :param args: arguments to the model / guide (these can possibly vary during
             the course of fitting).
         :param kwargs: keyword arguments to the model / guide.
@@ -413,21 +334,15 @@ class SVGD:
         return loss_val
 
     def predict(self, state, *args, num_samples=1, **kwargs):
-        def predict_model(rng_key, params):
-            guide_trace = handlers.trace(handlers.substitute(handlers.seed(self.guide, rng_key), params)
-                                         ).get_trace(*args, **kwargs)
-            model_trace = handlers.trace(handlers.replay(
-                handlers.substitute(handlers.seed(self.model, rng_key), params), guide_trace)
-            ).get_trace(*args, **kwargs)
-            return {name: site['value'] for name, site in model_trace.items() if ('is_observed' not in site) or not site['is_observed']}
-
         _, rng_key_predict = jax.random.split(state.rng_key)
         params = self.get_params(state)
         classic_params = {p: v for p, v in params.items() if
                           p not in self.guide_param_names or self.classic_guide_params_fn(p)}
         stein_params = {p: v for p, v in params.items() if p not in classic_params}
         if num_samples == 1:
-            return jax.vmap(lambda sp: predict_model(rng_key_predict, {**sp, **classic_params}))(stein_params)
+            return jax.vmap(lambda sp: self._predict_model(rng_key_predict, {**sp, **classic_params}, *args, **kwargs)
+                            )(stein_params)
         else:
-            return jax.vmap(lambda rk: jax.vmap(lambda sp: predict_model(rk, {**sp, **classic_params}))(stein_params))(
-                jax.random.split(rng_key_predict))
+            return jax.vmap(lambda rk: jax.vmap(lambda sp: self._predict_model(rk, {**sp, **classic_params},
+                                                                               *args, **kwargs)
+                                                )(stein_params))(jax.random.split(rng_key_predict, num_samples))
