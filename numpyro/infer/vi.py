@@ -50,7 +50,7 @@ class VI(ABC):
 
         state = self.init(rng_key, *args, *batch_args, **kwargs, **batch_kwargs)
         loss = self.evaluate(state, *args, *batch_args, **kwargs, **batch_kwargs)
-        if not callbacks:
+        if not callbacks and batch_fun is None and validation_fun is None:
             state, loss = fori_loop(0, num_steps, lambda i, info: bodyfn(i, info, *args, **kwargs), (state, loss))
         else:
             try:
