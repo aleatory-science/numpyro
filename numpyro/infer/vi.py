@@ -1,14 +1,18 @@
 from abc import ABC, abstractmethod
+from functools import namedtuple
 from typing import List
 
 import jax
 from jax.lax import fori_loop
 
 import numpyro.callbacks.callback as ncallback
+import numpyro.callbacks.checkpoint as ncheckpoint
 from numpyro import handlers
 
 
 class VI(ABC):
+    CurrentState = namedtuple('CurrentState', ['optim_state', 'rng_key'])
+
     def __init__(self, model, guide, optim, loss, name, **static_kwargs):
         self.model = model
         self.guide = guide
@@ -38,18 +42,26 @@ class VI(ABC):
         raise NotImplementedError
 
     def train(self, rng_key, num_steps, *args, callbacks: List[ncallback.Callback] = None, batch_fun=None,
-              validation_rate=5, validation_fun=None, **kwargs):
+              validation_rate=5, validation_fun=None, restore=False, restore_path=None, **kwargs):
         def bodyfn(_i, info, *args, **kwargs):
             body_state, _ = info
             return self.update(body_state, *args, **kwargs)
+
+        rng_key, data_key, shuffle_key = jax.random.split(rng_key, 3)
         if batch_fun is not None:
-            batch_args, batch_kwargs, _, _ = batch_fun(0)
+            batch_args, batch_kwargs, _, _ = batch_fun(0, shuffle_key)
         else:
             batch_args = ()
             batch_kwargs = {}
 
         state = self.init(rng_key, *args, *batch_args, **kwargs, **batch_kwargs)
-        loss = self.evaluate(state, *args, *batch_args, **kwargs, **batch_kwargs)
+        if restore:
+            opt_state, rng_key, loss = ncheckpoint.Checkpoint.load(restore_path)
+            state = VI.CurrentState(opt_state, rng_key)
+
+            num_steps -= state[0][0]
+        else:
+            loss = self.evaluate(state, *args, *batch_args, **kwargs, **batch_kwargs)
         if not callbacks and batch_fun is None and validation_fun is None:
             state, loss = fori_loop(0, num_steps, lambda i, info: bodyfn(i, info, *args, **kwargs), (state, loss))
         else:
@@ -70,7 +82,8 @@ class VI(ABC):
                     epoch = 0
                     is_last = False
                     if batch_fun is not None:
-                        batch_args, batch_kwargs, epoch, is_last = batch_fun(i)
+                        data_key, shuffle_key = jax.random.split(data_key)
+                        batch_args, batch_kwargs, epoch, is_last = batch_fun(i, shuffle_key)
                         if epoch_begin:
                             epoch_begin = False
                             for callback in callbacks:

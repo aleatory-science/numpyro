@@ -1,9 +1,4 @@
-import _pickle as c_pickle
-import bz2
-import pathlib
-import time
-from datetime import datetime
-from functools import namedtuple, partial
+from functools import partial
 from typing import Callable
 
 import jax
@@ -13,22 +8,21 @@ from jax import ops
 from jax.tree_util import tree_map
 
 from numpyro import handlers
-from numpyro.distributions import constraints
-from numpyro.distributions.transforms import biject_to, IdentityTransform
+from numpyro.distributions.transforms import IdentityTransform
 from numpyro.infer import NUTS, MCMC, VI
 from numpyro.infer.guide import ReinitGuide
 from numpyro.infer.kernels import SteinKernel
 from numpyro.infer.util import transform_fn, get_parameter_transform
 from numpyro.util import ravel_pytree
 
+
 # TODO
 # Fix MCMC updates to work reasonably with optimizer
-
-SteinState = namedtuple('SteinState', ['optim_state', 'rng_key'])
 
 
 # Lots of code based on SVI interface and commonalities should be refactored
 class Stein(VI):
+
     def __init__(self, model, guide: ReinitGuide, optim, loss, kernel_fn: SteinKernel, num_particles: int = 10,
                  loss_temperature: float = 1.0, repulsion_temperature: float = 1.0,
                  classic_guide_params_fn: Callable[[str], bool] = lambda name: False, sp_mcmc_crit='infl',
@@ -46,8 +40,7 @@ class Stein(VI):
             (More particles capture more of the posterior distribution)
         :param loss_temperature: scaling of loss factor
         :param repulsion_temperature: scaling of repulsive forces (Non-linear Stein)
-        :param classic_guide_param_fn: predicate on names of parameters in guide which should be optimized classically without Stein
-                (E.g., parameters for large normal networks or other transformation)
+        :param classic_guide_param_fn: predicate on names of parameters in guide which should be optimized classically without Stein (E.g., parameters for large normal networks or other transformation)
         :param sp_mcmc_crit: Stein Point MCMC update selection criterion, either 'infl' for most influential or 'rand' for random (EXPERIMENTAL)
         :param sp_mode: Stein Point MCMC mode for calculating Kernelized Stein Discrepancy. Either 'local' for only the updated MCMC particles or 'global' for all particles. (EXPERIMENTAL)
         :param num_mcmc_particles: Number of particles that should be updated with Stein Point MCMC (should be a subset of number of Stein particles) (EXPERIMENTAL)
@@ -281,7 +274,7 @@ class Stein(VI):
         self.constrain_fn = partial(transform_fn, inv_transforms)
         self.uconstrain_fn = partial(transform_fn, transforms)
         self.particle_transform_fn = partial(transform_fn, particle_transforms)
-        return SteinState(self.optim.init(params), rng_key)
+        return VI.CurrentState(self.optim.init(params), rng_key)
 
     def get_params(self, state):
         """
@@ -315,7 +308,7 @@ class Stein(VI):
         loss_val, grads = self._svgd_loss_and_grads(rng_key_step, params,
                                                     *args, **kwargs, **self.static_kwargs)
         optim_state = self.optim.update(grads, optim_state)
-        return SteinState(optim_state, rng_key), loss_val
+        return VI.CurrentState(optim_state, rng_key), loss_val
 
     def evaluate(self, state, *args, **kwargs):
         """

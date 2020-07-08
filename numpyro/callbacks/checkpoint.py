@@ -1,5 +1,9 @@
 import pickle
 from datetime import datetime
+from pathlib import Path
+import os
+
+from jax.experimental.optimizers import unpack_optimizer_state, pack_optimizer_state
 
 from numpyro.callbacks.callback import Callback
 
@@ -44,10 +48,51 @@ class Checkpoint(Callback):
             file_path = self.file_path.replace('{num}', "{}_{}".format(prefix, 'best'))
         if '{time}' in self.file_path:
             file_path = file_path.replace('{time}', self.time)
-        with open(file_path, 'w') as fp:
-            pickle.dump(state, fp)
+        step, opt_state = state.optim_state
+
+        with open(file_path, 'wb') as fp:
+            pickle.dump((step, unpack_optimizer_state(opt_state), state.rng_key, loss), fp)
+
+    def latest(self):
+        path = Path(self.file_path)
+        return max(path.parent.glob('*'+''.join(path.suffixes)), key=os.path.getctime)
 
     @classmethod
     def load(cls, file_path):
-        with open(file_path, 'r') as fp:
-            return pickle.load(fp)
+        with open(file_path, 'rb') as fp:
+            step, opt_state, rng_key, loss = pickle.load(fp)
+        return (step, pack_optimizer_state(opt_state)), rng_key, loss
+
+
+if __name__ == '__main__':
+    # TODO: transfer to test!
+    import jax
+    import numpyro
+    import numpyro.distributions as dist
+
+    from numpyro.infer import Stein, ELBO
+    from numpyro.infer.stein import SteinState
+    from numpyro.infer.kernels import RBFKernel
+    from numpyro.infer.initialization import init_with_noise, init_to_value
+    from numpyro.optim import Adam
+    from numpyro.contrib.autoguide import AutoDelta
+
+
+    def model():
+        numpyro.sample('x', dist.MultivariateNormal(loc=jax.numpy.array([5., 10.]), covariance_matrix=[[3., 5.],
+                                                                                                       [5., 10.]]))
+
+
+    guide = AutoDelta(model, init_strategy=init_with_noise(init_to_value(values={'x': jax.numpy.array([-10., 30])}),
+                                                           noise_scale=1.0))
+
+    optim = Adam(.1)
+    loss = ELBO()
+    kernel = RBFKernel()
+
+    stein = Stein(model, guide, optim, loss, kernel)
+    state = stein.init(jax.random.PRNGKey(0))
+    Checkpoint('tmp.plk')._checkpoint('', 0., 0., state)
+    optim_state, rng_key, loss = Checkpoint.load('tmp.plk')
+    loaded_state = SteinState(optim_state, rng_key)
+    print(loaded_state, loss)
