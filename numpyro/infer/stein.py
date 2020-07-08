@@ -236,7 +236,7 @@ class Stein(VI):
             the course of fitting).
         :param kwargs: keyword arguments to the model / guide (these can possibly vary
             during the course of fitting).
-        :return: initial :data:`SteinState`
+        :return: initial :data:`CurrentState`
         """
         rng_key, model_seed, guide_seed = jax.random.split(rng_key, 3)
         model_init = handlers.seed(self.model, model_seed)
