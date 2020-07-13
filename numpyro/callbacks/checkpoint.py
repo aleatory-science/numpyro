@@ -1,7 +1,7 @@
+import os
 import pickle
 from datetime import datetime
 from pathlib import Path
-import os
 
 from jax.experimental.optimizers import unpack_optimizer_state, pack_optimizer_state
 
@@ -55,7 +55,10 @@ class Checkpoint(Callback):
 
     def latest(self):
         path = Path(self.file_path)
-        return max(path.parent.glob('*'+''.join(path.suffixes)), key=os.path.getctime)
+        restore_files = path.parent.glob('*' + ''.join(path.suffixes))
+        if restore_files:
+            return max(restore_files, key=os.path.getctime)
+        return None
 
     @classmethod
     def load(cls, file_path):

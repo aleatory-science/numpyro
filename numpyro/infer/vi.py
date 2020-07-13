@@ -55,7 +55,7 @@ class VI(ABC):
             batch_kwargs = {}
 
         state = self.init(rng_key, *args, *batch_args, **kwargs, **batch_kwargs)
-        if restore:
+        if restore and restore_path:
             opt_state, rng_key, loss = ncheckpoint.Checkpoint.load(restore_path)
             state = VI.CurrentState(opt_state, rng_key)
 
