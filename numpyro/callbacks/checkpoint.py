@@ -56,9 +56,10 @@ class Checkpoint(Callback):
     def latest(self):
         path = Path(self.file_path)
         restore_files = path.parent.glob('*' + ''.join(path.suffixes))
-        if restore_files:
+        try:
             return max(restore_files, key=os.path.getctime)
-        return None
+        except ValueError:
+            return None
 
     @classmethod
     def load(cls, file_path):
