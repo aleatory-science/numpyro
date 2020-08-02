@@ -275,14 +275,15 @@ def copy_docs_from(source_class, full_text=False):
 
 pytree_metadata = namedtuple('pytree_metadata', ['flat', 'shape', 'event_size', 'dtype'])
 
+
 def _ravel_list(*leaves, batch_dims):
     leaves_metadata = tree_map(lambda l: pytree_metadata(
-        jnp.reshape(l, (*jnp.shape(l)[:batch_dims], -1)), jnp.shape(l), 
+        jnp.reshape(l, (*jnp.shape(l)[:batch_dims], -1)), jnp.shape(l),
         jnp.prod(jnp.shape(l)[batch_dims:], dtype='int32'), canonicalize_dtype(lax.dtype(l))), leaves)
     leaves_idx = jnp.cumsum(jnp.array((0,) + tuple(d.event_size for d in leaves_metadata)))
 
     def unravel_list(arr):
-        return [jnp.reshape(lax.dynamic_slice_in_dim(arr, leaves_idx[i], m.event_size), 
+        return [jnp.reshape(lax.dynamic_slice_in_dim(arr, leaves_idx[i], m.event_size),
                             m.shape[batch_dims:]).astype(m.dtype)
                 for i, m in enumerate(leaves_metadata)]
 
@@ -303,25 +304,54 @@ def ravel_pytree(pytree, *, batch_dims=0):
 def posdef(m):
     mlambda, mvec = jnp.linalg.eigh(m)
     if jnp.ndim(mlambda) >= 2:
-        mlambda = jax.vmap(lambda ml: jnp.diag(jnp.maximum(ml, 1e-5)), in_axes=tuple(range(jnp.ndim(mlambda) - 1)))(mlambda)
+        mlambda = jax.vmap(lambda ml: jnp.diag(jnp.maximum(ml, 1e-5)), in_axes=tuple(range(jnp.ndim(mlambda) - 1)))(
+            mlambda)
     else:
         mlambda = jnp.diag(jnp.maximum(mlambda, 1e-5))
     return mvec @ mlambda @ jnp.swapaxes(mvec, -2, -1)
 
+
 def sqrth(m):
     mlambda, mvec = jnp.linalg.eigh(m)
     if jnp.ndim(mlambda) >= 2:
-        mlambdasqrt = jax.vmap(lambda ml: jnp.diag(jnp.maximum(ml, 1e-5) ** 0.5), in_axes=tuple(range(jnp.ndim(mlambda) - 1)))(mlambda)
+        mlambdasqrt = jax.vmap(lambda ml: jnp.diag(jnp.maximum(ml, 1e-5) ** 0.5),
+                               in_axes=tuple(range(jnp.ndim(mlambda) - 1)))(mlambda)
     else:
         mlambdasqrt = jnp.diag(jnp.maximum(mlambda, 1e-5) ** 0.5)
     msqrt = mvec @ mlambdasqrt @ jnp.swapaxes(mvec, -2, -1)
     return msqrt
+
 
 def safe_norm(a, ord=2, axis=None):
     if axis is not None:
         is_zero = jnp.expand_dims(jnp.isclose(jnp.sum(a, axis=axis), 0.), axis=axis)
     else:
         is_zero = jnp.ones_like(a, dtype='bool')
-    norm = jnp.linalg.norm(a + jnp.where(is_zero, jnp.ones_like(a) * 1e-5 ** ord, jnp.zeros_like(a)), ord=ord, axis=axis)
+    norm = jnp.linalg.norm(a + jnp.where(is_zero, jnp.ones_like(a) * 1e-5 ** ord, jnp.zeros_like(a)), ord=ord,
+                           axis=axis)
     return norm
 
+
+def _safezeroorinf(a):
+    aa = jnp.where(a == 0.0, jnp.ones_like(a) * 1e-12, a)
+    aa = jnp.where(a == float('inf'), jnp.ones_like(a) * 1e12, aa)
+    aa = jnp.where(a == -float('inf'), jnp.ones_like(a) * -1e12, aa)
+    return aa
+
+
+def safe_mul(a, b):
+    aa = _safezeroorinf(a)
+    bb = _safezeroorinf(b)
+    res = jnp.where((a == 0.0) | (b == 0.0), 0.0, aa * bb)
+    res = jnp.where(((a == float('inf')) & (b == float('inf'))) |
+                    ((a == -float('inf')) & (b == -float('inf'))),
+                    jnp.ones_like(a) * float('inf'), res)
+    res = jnp.where(((a == -float('inf')) & (b == float('inf'))) |
+                    ((a == float('inf')) & (b == -float('inf'))),
+                    jnp.ones_like(a) * -float('inf'), res)
+    return res
+
+
+def safe_div(a, b):
+    bb = jnp.where(b == 0, b + jnp.ones_like(b) * 1e-12, b)
+    return a / bb
