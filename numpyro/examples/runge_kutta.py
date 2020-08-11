@@ -47,13 +47,13 @@ def _runge_kutta_4(f: Callable[[float, jnp.ndarray, KwArg], jnp.ndarray],
         y, rng_key, lyapunov_loss = s
         t = i * step_size
         k1, rng_key = jax.random.split(rng_key)
-        noise = jax.random.normal(k1, jnp.shape(y)) * lyapunov_scale
-        ly_prev = constrain_fn('y', unconstrain_fn('y', y) + noise)
-        ly = step(t, ly_prev, **nkwargs)
+        # noise = jax.random.normal(k1, jnp.shape(y)) * lyapunov_scale
+        # ly_prev = constrain_fn('y', unconstrain_fn('y', y) + noise)
+        # ly = step(t, ly_prev, **nkwargs)
         y_und = step(t, y, **kwargs)
         y = (1 - dampening_rate) * jax.lax.stop_gradient(y_und) + dampening_rate * y_und
-        ll = jnp.sum(jnp.abs(y - ly)) / jnp.sum(jnp.abs(noise))
-        lyapunov_loss = lyapunov_loss + jnp.maximum(0.0, jnp.log(ll))
+        # ll = jnp.sum(jnp.abs(y - ly)) / jnp.sum(jnp.abs(noise))
+        lyapunov_loss = 0.0  # lyapunov_loss + jnp.maximum(0.0, jnp.log(ll))
         return ((y, rng_key, lyapunov_loss), y)
 
     s = (y0, rng_key, jnp.array(0.))
