@@ -1,16 +1,16 @@
 import jax
 import jax.numpy as jnp
-from jax.lax import scan
 import matplotlib.pyplot as plt
 import numpy.random as npr
 from jax.config import config
+from jax.lax import scan
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.callbacks import Progbar
 from numpyro.infer import SVI, ELBO
 from numpyro.infer.autoguide import AutoDelta
 from numpyro.optim import Adam
+from jaxinterp.interpreter import _make_jaxpr_with_consts, interpret
 
 
 def predator_prey(prey0, predator0, *, r=0.6, k=100,
@@ -18,8 +18,8 @@ def predator_prey(prey0, predator0, *, r=0.6, k=100,
                   step_size=0.01, num_iterations=100):
     def pp_upd(state, _):
         prey, predator = state
-        sh = prey * predator / (a + prey)
-        prey_upd = r * prey * (1 - prey / k) - s * sh
+        sh = prey * predator / (a + prey + 1e-3)
+        prey_upd = r * prey * (1 - prey / (k + 1e-3)) - s * sh
         predator_upd = u * sh - v * predator
         prey = prey + step_size * prey_upd
         predator = predator + step_size * predator_upd
@@ -46,8 +46,8 @@ def model(prey, predator, idxs):
                                      r=r, k=k, s=s,
                                      a=a, u=u, v=v)
     with numpyro.plate('data', prey.shape[0], dim=-2):
-        numpyro.sample('prey_obs', dist.Normal(sprey[idxs], 1.), obs=prey)
-        numpyro.sample('predator_obs', dist.Normal(spredator[idxs], 1.), obs=predator)
+        numpyro.sample('prey_obs', dist.Normal(sprey[idxs], 100.), obs=prey)
+        numpyro.sample('predator_obs', dist.Normal(spredator[idxs], 100.), obs=predator)
 
 
 if __name__ == '__main__':
@@ -63,4 +63,24 @@ if __name__ == '__main__':
     guide = AutoDelta(model)
     svi = SVI(model, guide, Adam(0.25), ELBO())
     rng_key = jax.random.PRNGKey(1377)
-    svi.train(rng_key, 10_000, obs_prey, obs_predator, idxs, callbacks=[Progbar()])
+    state = svi.init(rng_key, obs_prey, obs_predator, idxs)
+    prev_state = state
+    upd_fn = jax.jit(svi.update)
+    try:
+        for i in range(10_000):
+            prev_state = state
+            state, loss = upd_fn(state, obs_prey, obs_predator, idxs)
+            if i % 100 == 0:
+                print(f"{i}: {loss}")
+    except FloatingPointError:
+        config.update('jax_debug_nans', False)
+        _, rng_key_eval = jax.random.split(prev_state.rng_key)
+        params = svi.get_params(prev_state)
+        print(svi.evaluate(prev_state, obs_prey, obs_predator, idxs))
+        grady = jax.grad(lambda p: svi.loss.loss(rng_key_eval, p, svi.model, svi.guide,
+                                                 obs_prey, obs_predator, idxs))
+        # For getting the Jaxpr
+        grad_jaxpr, consts, trees = _make_jaxpr_with_consts(grady, stage_out=True)(params)
+        print(grad_jaxpr)
+        # For debugging using interpreter
+        interpret(grady, stage_out=True)(params)
