@@ -234,7 +234,7 @@ def fori_collect(lower, upper, body_fun, init_val, transform=identity,
     return (unravel_collection, last_val) if return_last_val else unravel_collection
 
 
-pytree_metadata = namedtuple('pytree_metadata', ['flat', 'shape', 'size', 'dtype'])
+pytree_metadata = namedtuple('pytree_metadata', ['flat', 'shape', 'event_size', 'dtype'])
 
 
 def _ravel_list(*leaves, batch_dims):

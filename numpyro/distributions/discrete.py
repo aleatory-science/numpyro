@@ -424,7 +424,6 @@ class OrderedLogistic(CategoricalProbs):
         super(OrderedLogistic, self).__init__(probs, validate_args=validate_args)
 
 
-@copy_docs_from(Distribution)
 class MultinomialProbs(Distribution):
     arg_constraints = {'probs': constraints.simplex,
                        'total_count': constraints.nonnegative_integer}

@@ -6,7 +6,7 @@ from functools import namedtuple, partial
 import jax
 from jax import random, value_and_grad
 
-from numpyro.handlers import seed, trace
+from numpyro.handlers import seed, trace, replay
 from numpyro.infer import VI
 from numpyro.infer.util import transform_fn, get_parameter_transform
 
