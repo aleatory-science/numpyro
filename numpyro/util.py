@@ -1,7 +1,7 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections import namedtuple, OrderedDict
+from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
 import os
 import random
@@ -17,7 +17,6 @@ from jax.dtypes import canonicalize_dtype
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten, tree_map, tree_unflatten
 
-_DATA_TYPES = {}
 _DISABLE_CONTROL_FLOW_PRIM = False
 
 
@@ -235,45 +234,7 @@ def fori_collect(lower, upper, body_fun, init_val, transform=identity,
     return (unravel_collection, last_val) if return_last_val else unravel_collection
 
 
-def copy_docs_from(source_class, full_text=False):
-    """
-    Decorator to copy class and method docs from source to destin class.
-    """
-
-    def decorator(destin_class):
-        # This works only in python 3.3+:
-        # if not destin_class.__doc__:
-        #     destin_class.__doc__ = source_class.__doc__
-        for name in dir(destin_class):
-            if name.startswith('_'):
-                continue
-            destin_attr = getattr(destin_class, name)
-            destin_attr = getattr(destin_attr, '__func__', destin_attr)
-            source_attr = getattr(source_class, name, None)
-            source_doc = getattr(source_attr, '__doc__', None)
-            if source_doc and not getattr(destin_attr, '__doc__', None):
-                if full_text or source_doc.startswith('See '):
-                    destin_doc = source_doc
-                else:
-                    destin_doc = 'See :meth:`{}.{}.{}`'.format(
-                        source_class.__module__, source_class.__name__, name)
-                if isinstance(destin_attr, property):
-                    # Set docs for object properties.
-                    # Since __doc__ is read-only, we need to reset the property
-                    # with the updated doc.
-                    updated_property = property(destin_attr.fget,
-                                                destin_attr.fset,
-                                                destin_attr.fdel,
-                                                destin_doc)
-                    setattr(destin_class, name, updated_property)
-                else:
-                    destin_attr.__doc__ = destin_doc
-        return destin_class
-
-    return decorator
-
-
-pytree_metadata = namedtuple('pytree_metadata', ['flat', 'shape', 'event_size', 'dtype'])
+pytree_metadata = namedtuple('pytree_metadata', ['flat', 'shape', 'size', 'dtype'])
 
 
 def _ravel_list(*leaves, batch_dims):
@@ -299,6 +260,46 @@ def ravel_pytree(pytree, *, batch_dims=0):
         return tree_unflatten(treedef, unravel_list(arr))
 
     return flat, unravel_pytree
+
+
+def soft_vmap(fn, xs, batch_ndims=1, chunk_size=None):
+    """
+    Vectorizing map that maps a function `fn` over `batch_ndims` leading axes
+    of `xs`. This uses jax.vmap over smaller chunks of the batch dimensions
+    to keep memory usage constant.
+
+    :param callable fn: The function to map over.
+    :param xs: JAX pytree (e.g. an array, a list/tuple/dict of arrays,...)
+    :param int batch_ndims: The number of leading dimensions of `xs`
+        to apply `fn` element-wise over them.
+    :param int chunk_size: Size of each chunk of `xs`.
+        Defaults to the size of batch dimensions.
+    :returns: output of `fn(xs)`.
+    """
+    flatten_xs = tree_flatten(xs)[0]
+    batch_shape = np.shape(flatten_xs[0])[:batch_ndims]
+    for x in flatten_xs[1:]:
+        assert np.shape(x)[:batch_ndims] == batch_shape
+
+    # we'll do map(vmap(fn), xs) and make xs.shape = (num_chunks, chunk_size, ...)
+    num_chunks = batch_size = int(np.prod(batch_shape))
+    prepend_shape = (-1,) if batch_size > 1 else ()
+    xs = tree_map(lambda x: jnp.reshape(x, prepend_shape + jnp.shape(x)[batch_ndims:]), xs)
+    # XXX: probably for the default behavior with chunk_size=None,
+    # it is better to catch OOM error and reduce chunk_size by half until OOM disappears.
+    chunk_size = batch_size if chunk_size is None else min(batch_size, chunk_size)
+    if chunk_size > 1:
+        pad = chunk_size - (batch_size % chunk_size)
+        xs = tree_map(lambda x: jnp.pad(x, ((0, pad),) + ((0, 0),) * (np.ndim(x) - 1)), xs)
+        num_chunks = batch_size // chunk_size + int(pad > 0)
+        prepend_shape = (-1,) if num_chunks > 1 else ()
+        xs = tree_map(lambda x: jnp.reshape(x, prepend_shape + (chunk_size,) + jnp.shape(x)[1:]), xs)
+        fn = vmap(fn)
+
+    ys = lax.map(fn, xs) if num_chunks > 1 else fn(xs)
+    map_ndims = int(num_chunks > 1) + int(chunk_size > 1)
+    ys = tree_map(lambda y: jnp.reshape(y, (-1,) + jnp.shape(y)[map_ndims:])[:batch_size], ys)
+    return tree_map(lambda y: jnp.reshape(y, batch_shape + jnp.shape(y)[1:]), ys)
 
 
 def posdef(m):

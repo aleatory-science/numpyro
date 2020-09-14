@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpyro
 from numpyro import handlers
 import numpyro.distributions as dist
+from numpyro.distributions import constraints
 from numpyro.infer.util import log_density
 from numpyro.util import optional
 
@@ -25,15 +26,16 @@ def test_mask(mask_last, use_jit):
     def model(data, mask):
         with numpyro.plate('N', N):
             x = numpyro.sample('x', dist.Normal(0, 1))
-            with handlers.mask(mask_array=mask):
+            with handlers.mask(mask=mask):
                 numpyro.sample('y', dist.Delta(x, log_density=1.))
-                with handlers.scale(scale_factor=2):
+                with handlers.scale(scale=2):
                     numpyro.sample('obs', dist.Normal(x, 1), obs=data)
 
     data = random.normal(random.PRNGKey(0), (N,))
     x = random.normal(random.PRNGKey(1), (N,))
     if use_jit:
-        log_joint = jit(log_density, static_argnums=(0,))(model, (data, mask), {}, {'x': x, 'y': x})[0]
+        log_joint = jit(lambda *args: log_density(*args)[0], static_argnums=(0,))(
+            model, (data, mask), {}, {'x': x, 'y': x})
     else:
         log_joint = log_density(model, (data, mask), {}, {'x': x, 'y': x})[0]
     log_prob_x = dist.Normal(0, 1).log_prob(x)
@@ -43,11 +45,20 @@ def test_mask(mask_last, use_jit):
     assert_allclose(log_joint, expected, atol=1e-4)
 
 
+def test_mask_inf():
+    def model():
+        with handlers.mask(mask=jnp.zeros(10, dtype=bool)):
+            numpyro.factor('inf', -jnp.inf)
+
+    log_joint = log_density(model, (), {}, {})[0]
+    assert_allclose(log_joint, 0.)
+
+
 @pytest.mark.parametrize('use_context_manager', [True, False])
 def test_scale(use_context_manager):
     def model(data):
         x = numpyro.sample('x', dist.Normal(0, 1))
-        with optional(use_context_manager, handlers.scale(scale_factor=10)):
+        with optional(use_context_manager, handlers.scale(scale=10)):
             numpyro.sample('obs', dist.Normal(x, 1), obs=data)
 
     model = model if use_context_manager else handlers.scale(model, 10.)
@@ -111,9 +122,7 @@ def test_condition():
     model_trace = handlers.trace(model).get_trace()
     assert model_trace['y']['value'] == 2.
     assert model_trace['y']['is_observed']
-    # Raise ValueError when site is already observed.
-    with pytest.raises(ValueError):
-        handlers.condition(model, {'y': 3.})()
+    assert handlers.condition(model, {'y': 3.})() == 3.
 
 
 def test_no_split_deterministic():
@@ -242,6 +251,78 @@ def test_plate_stack(shape):
     assert x.shape == shape
 
 
+@pytest.mark.parametrize('intervene,observe,flip', [
+    (True, False, False),
+    (False, True, False),
+    (True, True, False),
+    (True, True, True),
+])
+def test_counterfactual_query(intervene, observe, flip):
+    # x -> y -> z -> w
+
+    sites = ["x", "y", "z", "w"]
+    observations = {"x": 1., "y": None, "z": 1., "w": 1.}
+    interventions = {"x": None, "y": 0., "z": 2., "w": 1.}
+
+    def model():
+        with handlers.seed(rng_seed=0):
+            x = numpyro.sample("x", dist.Normal(0, 1))
+            y = numpyro.sample("y", dist.Normal(x, 1))
+            z = numpyro.sample("z", dist.Normal(y, 1))
+            w = numpyro.sample("w", dist.Normal(z, 1))
+            return dict(x=x, y=y, z=z, w=w)
+
+    if not flip:
+        if intervene:
+            model = handlers.do(model, data=interventions)
+        if observe:
+            model = handlers.condition(model, data=observations)
+    elif flip and intervene and observe:
+        model = handlers.do(
+            handlers.condition(model, data=observations),
+            data=interventions)
+
+    with handlers.trace() as tr:
+        actual_values = model()
+    for name in sites:
+        # case 1: purely observational query like handlers.condition
+        if not intervene and observe:
+            if observations[name] is not None:
+                assert tr[name]['is_observed']
+                assert_allclose(observations[name], actual_values[name])
+                assert_allclose(observations[name], tr[name]['value'])
+            if interventions[name] != observations[name]:
+                if interventions[name] is not None:
+                    assert_raises(AssertionError, assert_allclose, interventions[name], actual_values[name])
+        # case 2: purely interventional query like old handlers.do
+        elif intervene and not observe:
+            assert not tr[name]['is_observed']
+            if interventions[name] is not None:
+                assert_allclose(interventions[name], actual_values[name])
+            if observations[name] is not None:
+                assert_raises(AssertionError, assert_allclose, observations[name], tr[name]['value'])
+            if interventions[name] is not None:
+                assert_raises(AssertionError, assert_allclose, interventions[name], tr[name]['value'])
+        # case 3: counterfactual query mixing intervention and observation
+        elif intervene and observe:
+            if observations[name] is not None:
+                assert tr[name]['is_observed']
+                assert_allclose(observations[name], tr[name]['value'])
+            if interventions[name] is not None:
+                assert_allclose(interventions[name], actual_values[name])
+            if interventions[name] != observations[name]:
+                if interventions[name] is not None:
+                    assert_raises(AssertionError, assert_allclose, interventions[name], tr[name]['value'])
+
+
+def test_block():
+    with handlers.trace() as trace:
+        with handlers.block(hide=['x']):
+            with handlers.seed(rng_seed=0):
+                numpyro.sample('x', dist.Normal())
+    assert 'x' not in trace
+
+
 def test_scope():
     def fn():
         return numpyro.sample('x', dist.Normal())
@@ -256,3 +337,48 @@ def test_scope():
 
     assert 'a/x' in trace
     assert 'b/a/x' in trace
+
+
+def test_lift():
+    def model():
+        loc1 = numpyro.param("loc1", 0.)
+        scale1 = numpyro.param("scale1", 1., constraint=constraints.positive)
+        numpyro.sample("latent1", dist.Normal(loc1, scale1))
+
+        loc2 = numpyro.param("loc2", 1.)
+        scale2 = numpyro.param("scale2", 2., constraint=constraints.positive)
+        latent2 = numpyro.sample("latent2", dist.Normal(loc2, scale2))
+        return latent2
+
+    loc1_prior = dist.Normal()
+    scale1_prior = dist.LogNormal()
+    prior = {"loc1": loc1_prior, "scale1": scale1_prior}
+
+    with handlers.trace() as tr:
+        with handlers.seed(rng_seed=1):
+            model()
+
+    with handlers.trace() as lifted_tr:
+        with handlers.seed(rng_seed=2):
+            with handlers.lift(prior=prior):
+                model()
+
+    for name in tr.keys():
+        assert name in lifted_tr
+        if name in prior:
+            assert lifted_tr[name]['fn'] is prior[name]
+            assert lifted_tr[name]['type'] == 'sample'
+            assert lifted_tr[name]['value'] not in (0., 1.)
+        elif name in ('loc2', 'scale2'):
+            assert lifted_tr[name]['type'] == 'param'
+
+
+def test_lift_memoize():
+    def model():
+        a = numpyro.param("loc")
+        b = numpyro.param("loc")
+        assert a == b
+
+    with handlers.seed(rng_seed=1):
+        with handlers.lift(prior=dist.Normal(0, 1)):
+            model()

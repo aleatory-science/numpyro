@@ -20,6 +20,7 @@ from numpyro.distributions.util import (
     sum_rightmost,
     vec_to_tril_matrix
 )
+from numpyro.util import not_jax_tracer
 
 __all__ = [
     'biject_to',
@@ -31,7 +32,7 @@ __all__ = [
     'IdentityTransform',
     'InvCholeskyTransform',
     'LowerCholeskyTransform',
-    'MultivariateAffineTransform',
+    'LowerCholeskyAffine',
     'PermuteTransform',
     'PowerTransform',
     'SigmoidTransform',
@@ -79,7 +80,10 @@ class AbsTransform(Transform):
 
 
 class AffineTransform(Transform):
-    # TODO: currently, just support scale > 0
+    """
+    .. note:: When `scale` is a JAX tracer, we always assume that `scale > 0`
+        when calculating `codomain`.
+    """
     def __init__(self, loc, scale, domain=constraints.real):
         self.loc = loc
         self.scale = scale
@@ -92,10 +96,24 @@ class AffineTransform(Transform):
         elif self.domain is constraints.real_vector:
             return constraints.real_vector
         elif isinstance(self.domain, constraints.greater_than):
-            return constraints.greater_than(self.__call__(self.domain.lower_bound))
+            if not_jax_tracer(self.scale) and jnp.all(self.scale < 0):
+                return constraints.less_than(self(self.domain.lower_bound))
+            # we suppose scale > 0 for any tracer
+            else:
+                return constraints.greater_than(self(self.domain.lower_bound))
+        elif isinstance(self.domain, constraints.less_than):
+            if not_jax_tracer(self.scale) and jnp.all(self.scale < 0):
+                return constraints.greater_than(self(self.domain.upper_bound))
+            # we suppose scale > 0 for any tracer
+            else:
+                return constraints.less_than(self(self.domain.upper_bound))
         elif isinstance(self.domain, constraints.interval):
-            return constraints.interval(self.__call__(self.domain.lower_bound),
-                                        self.__call__(self.domain.upper_bound))
+            if not_jax_tracer(self.scale) and jnp.all(self.scale < 0):
+                return constraints.interval(self(self.domain.upper_bound),
+                                            self(self.domain.lower_bound))
+            else:
+                return constraints.interval(self(self.domain.lower_bound),
+                                            self(self.domain.upper_bound))
         else:
             raise NotImplementedError
 
@@ -314,28 +332,7 @@ class InvCholeskyTransform(Transform):
             return jnp.sum(order * jnp.log(jnp.diagonal(x, axis1=-2, axis2=-1)), axis=-1)
 
 
-class LowerCholeskyTransform(Transform):
-    domain = constraints.real_vector
-    codomain = constraints.lower_cholesky
-    event_dim = 2
-
-    def __call__(self, x):
-        n = round((math.sqrt(1 + 8 * x.shape[-1]) - 1) / 2)
-        z = vec_to_tril_matrix(x[..., :-n], diagonal=-1)
-        diag = jnp.exp(x[..., -n:])
-        return z + jnp.expand_dims(diag, axis=-1) * jnp.identity(n)
-
-    def inv(self, y):
-        z = matrix_to_tril_vec(y, diagonal=-1)
-        return jnp.concatenate([z, jnp.log(jnp.diagonal(y, axis1=-2, axis2=-1))], axis=-1)
-
-    def log_abs_det_jacobian(self, x, y, intermediates=None):
-        # the jacobian is diagonal, so logdet is the sum of diagonal `exp` transform
-        n = round((math.sqrt(1 + 8 * x.shape[-1]) - 1) / 2)
-        return x[..., -n:].sum(-1)
-
-
-class MultivariateAffineTransform(Transform):
+class LowerCholeskyAffine(Transform):
     r"""
     Transform via the mapping :math:`y = loc + scale\_tril\ @\ x`.
 
@@ -367,6 +364,27 @@ class MultivariateAffineTransform(Transform):
     def log_abs_det_jacobian(self, x, y, intermediates=None):
         return jnp.broadcast_to(jnp.log(jnp.diagonal(self.scale_tril, axis1=-2, axis2=-1)).sum(-1),
                                 jnp.shape(x)[:-1])
+
+
+class LowerCholeskyTransform(Transform):
+    domain = constraints.real_vector
+    codomain = constraints.lower_cholesky
+    event_dim = 2
+
+    def __call__(self, x):
+        n = round((math.sqrt(1 + 8 * x.shape[-1]) - 1) / 2)
+        z = vec_to_tril_matrix(x[..., :-n], diagonal=-1)
+        diag = jnp.exp(x[..., -n:])
+        return z + jnp.expand_dims(diag, axis=-1) * jnp.identity(n)
+
+    def inv(self, y):
+        z = matrix_to_tril_vec(y, diagonal=-1)
+        return jnp.concatenate([z, jnp.log(jnp.diagonal(y, axis1=-2, axis2=-1))], axis=-1)
+
+    def log_abs_det_jacobian(self, x, y, intermediates=None):
+        # the jacobian is diagonal, so logdet is the sum of diagonal `exp` transform
+        n = round((math.sqrt(1 + 8 * x.shape[-1]) - 1) / 2)
+        return x[..., -n:].sum(-1)
 
 
 class OrderedTransform(Transform):
@@ -562,6 +580,13 @@ def _transform_to_greater_than(constraint):
         return ExpTransform()
     return ComposeTransform([ExpTransform(),
                              AffineTransform(constraint.lower_bound, 1,
+                                             domain=constraints.positive)])
+
+
+@biject_to.register(constraints.less_than)
+def _transform_to_less_than(constraint):
+    return ComposeTransform([ExpTransform(),
+                             AffineTransform(constraint.upper_bound, -1,
                                              domain=constraints.positive)])
 
 

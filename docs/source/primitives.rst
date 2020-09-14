@@ -30,3 +30,15 @@ factor
 module
 ------
 .. autofunction:: numpyro.primitives.module
+
+haiku_module
+------------
+.. autofunction:: numpyro.contrib.module.haiku_module
+
+flax_module
+------------
+.. autofunction:: numpyro.contrib.module.flax_module
+
+scan
+----
+.. autofunction:: numpyro.contrib.control_flow.scan

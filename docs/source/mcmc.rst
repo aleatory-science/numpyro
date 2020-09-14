@@ -1,42 +1,48 @@
 Markov Chain Monte Carlo (MCMC)
 ===============================
 
-Hamiltonian Monte Carlo
------------------------
-
 .. autoclass:: numpyro.infer.mcmc.MCMC
     :members:
     :undoc-members:
     :show-inheritance:
     :member-order: bysource
 
-.. autoclass:: numpyro.infer.mcmc.HMC
+MCMC Kernels
+------------
+
+.. autoclass:: numpyro.infer.mcmc.MCMCKernel
     :members:
     :undoc-members:
     :show-inheritance:
     :member-order: bysource
 
-.. autoclass:: numpyro.infer.mcmc.NUTS
+.. autoclass:: numpyro.infer.hmc.HMC
     :members:
     :undoc-members:
     :show-inheritance:
     :member-order: bysource
 
-.. autoclass:: numpyro.infer.mcmc.SA
+.. autoclass:: numpyro.infer.hmc.NUTS
     :members:
     :undoc-members:
     :show-inheritance:
     :member-order: bysource
 
-.. autofunction:: numpyro.infer.mcmc.hmc
+.. autoclass:: numpyro.infer.sa.SA
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :member-order: bysource
 
-.. autofunction:: numpyro.infer.mcmc.hmc.init_kernel
+.. autofunction:: numpyro.infer.hmc.hmc
 
-.. autofunction:: numpyro.infer.mcmc.hmc.sample_kernel
+.. autofunction:: numpyro.infer.hmc.hmc.init_kernel
 
-.. autodata:: numpyro.infer.mcmc.HMCState
+.. autofunction:: numpyro.infer.hmc.hmc.sample_kernel
 
-.. autodata:: numpyro.infer.mcmc.SAState
+.. autodata:: numpyro.infer.hmc.HMCState
+
+.. autodata:: numpyro.infer.sa.SAState
 
 
 MCMC Utilities

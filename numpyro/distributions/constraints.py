@@ -36,6 +36,7 @@ __all__ = [
     'integer_greater_than',
     'interval',
     'is_dependent',
+    'less_than',
     'lower_cholesky',
     'multinomial',
     'nonnegative_integer',
@@ -114,6 +115,14 @@ class _GreaterThan(Constraint):
         return x > self.lower_bound
 
 
+class _LessThan(Constraint):
+    def __init__(self, upper_bound):
+        self.upper_bound = upper_bound
+
+    def __call__(self, x):
+        return x < self.upper_bound
+
+
 class _IntegerInterval(Constraint):
     def __init__(self, lower_bound, upper_bound):
         self.lower_bound = lower_bound
@@ -183,7 +192,7 @@ class _RealVector(Constraint):
 class _Simplex(Constraint):
     def __call__(self, x):
         x_sum = jnp.sum(x, axis=-1)
-        return jnp.all(x > 0, axis=-1) & (x_sum <= 1) & (x_sum > 1 - 1e-6)
+        return jnp.all(x >= 0, axis=-1) & (x_sum < 1 + 1e-6) & (x_sum > 1 - 1e-6)
 
 
 # TODO: Make types consistent
@@ -193,6 +202,7 @@ corr_cholesky = _CorrCholesky()
 corr_matrix = _CorrMatrix()
 dependent = _Dependent()
 greater_than = _GreaterThan
+less_than = _LessThan
 integer_interval = _IntegerInterval
 integer_greater_than = _IntegerGreaterThan
 interval = _Interval

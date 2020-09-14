@@ -2,95 +2,34 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from collections import namedtuple
-import functools
-import math
+from functools import partial
 from operator import attrgetter
 import os
 import warnings
 
-from jax import jit, lax, partial, pmap, random, vmap, device_put
+from jax import device_put, jit, lax, pmap, random
 from jax.core import Tracer
-from jax.dtypes import canonicalize_dtype
-from jax.flatten_util import ravel_pytree
 from jax.interpreters.xla import DeviceArray
 from jax.lib import xla_bridge
 import jax.numpy as jnp
-from jax.scipy.special import logsumexp
 from jax.tree_util import tree_flatten, tree_map, tree_multimap
 
 from numpyro.diagnostics import print_summary
-import numpyro.distributions as dist
-from numpyro.distributions.util import cholesky_update
-from numpyro.infer.hmc_util import (
-    IntegratorState,
-    build_tree,
-    euclidean_kinetic_energy,
-    find_reasonable_step_size,
-    velocity_verlet,
-    warmup_adapter
-)
-from numpyro.infer.util import ParamInfo, init_to_uniform, initialize_model
-from numpyro.util import cond, copy_docs_from, fori_collect, fori_loop, identity, cached_by
+from numpyro.util import cached_by, fori_collect, identity
 
-HMCState = namedtuple('HMCState', ['i', 'z', 'z_grad', 'potential_energy', 'energy', 'num_steps', 'accept_prob',
-                                   'mean_accept_prob', 'diverging', 'adapt_state', 'rng_key'])
-"""
-A :func:`~collections.namedtuple` consisting of the following fields:
-
- - **i** - iteration. This is reset to 0 after warmup.
- - **z** - Python collection representing values (unconstrained samples from
-   the posterior) at latent sites.
- - **z_grad** - Gradient of potential energy w.r.t. latent sample sites.
- - **potential_energy** - Potential energy computed at the given value of ``z``.
- - **energy** - Sum of potential energy and kinetic energy of the current state.
- - **num_steps** - Number of steps in the Hamiltonian trajectory (for diagnostics).
- - **accept_prob** - Acceptance probability of the proposal. Note that ``z``
-   does not correspond to the proposal if it is rejected.
- - **mean_accept_prob** - Mean acceptance probability until current iteration
-   during warmup adaptation or sampling (for diagnostics).
- - **diverging** - A boolean value to indicate whether the current trajectory is diverging.
- - **adapt_state** - A ``HMCAdaptState`` namedtuple which contains adaptation information
-   during warmup:
-
-   + **step_size** - Step size to be used by the integrator in the next iteration.
-   + **inverse_mass_matrix** - The inverse mass matrix to be used for the next
-     iteration.
-   + **mass_matrix_sqrt** - The square root of mass matrix to be used for the next
-     iteration. In case of dense mass, this is the Cholesky factorization of the
-     mass matrix.
-
- - **rng_key** - random number generator seed used for the iteration.
-"""
+__all__ = [
+    'MCMCKernel',
+    'MCMC',
+    'hmc',
+]
 
 
-def _get_num_steps(step_size, trajectory_length):
-    num_steps = jnp.clip(trajectory_length / step_size, a_min=1)
-    # NB: casting to jnp.int64 does not take effect (returns jnp.int32 instead)
-    # if jax_enable_x64 is False
-    return num_steps.astype(canonicalize_dtype(jnp.int64))
+def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
+    from numpyro.infer.hmc import hmc
 
-
-def momentum_generator(prototype_r, mass_matrix_sqrt, rng_key):
-    _, unpack_fn = ravel_pytree(prototype_r)
-    eps = random.normal(rng_key, jnp.shape(mass_matrix_sqrt)[:1])
-    if mass_matrix_sqrt.ndim == 1:
-        r = jnp.multiply(mass_matrix_sqrt, eps)
-        return unpack_fn(r)
-    elif mass_matrix_sqrt.ndim == 2:
-        r = jnp.dot(mass_matrix_sqrt, eps)
-        return unpack_fn(r)
-    else:
-        raise ValueError("Mass matrix has incorrect number of dims.")
-
-
-def get_diagnostics_str(mcmc_state):
-    if isinstance(mcmc_state, HMCState):
-        return '{} steps of size {:.2e}. acc. prob={:.2f}'.format(mcmc_state.num_steps,
-                                                                  mcmc_state.adapt_state.step_size,
-                                                                  mcmc_state.mean_accept_prob)
-    else:
-        return 'acc. prob={:.2f}'.format(mcmc_state.mean_accept_prob)
+    warnings.warn("The functional interface `hmc` has been moved to `numpyro.infer.hmc` module.",
+                  DeprecationWarning)
+    return hmc(potential_fn, potential_fn_gen, kinetic_fn, algo)
 
 
 def get_progbar_desc_str(num_warmup, i):
@@ -99,275 +38,53 @@ def get_progbar_desc_str(num_warmup, i):
     return 'sample'
 
 
-def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
-    r"""
-    Hamiltonian Monte Carlo inference, using either fixed number of
-    steps or the No U-Turn Sampler (NUTS) with adaptive path length.
-
-    **References:**
-
-    1. *MCMC Using Hamiltonian Dynamics*,
-       Radford M. Neal
-    2. *The No-U-turn sampler: adaptively setting path lengths in Hamiltonian Monte Carlo*,
-       Matthew D. Hoffman, and Andrew Gelman.
-    3. *A Conceptual Introduction to Hamiltonian Monte Carlo`*,
-       Michael Betancourt
-
-    :param potential_fn: Python callable that computes the potential energy
-        given input parameters. The input parameters to `potential_fn` can be
-        any python collection type, provided that `init_params` argument to
-        `init_kernel` has the same type.
-    :param potential_fn_gen: Python callable that when provided with model
-        arguments / keyword arguments returns `potential_fn`. This
-        may be provided to do inference on the same model with changing data.
-        If the data shape remains the same, we can compile `sample_kernel`
-        once, and use the same for multiple inference runs.
-    :param kinetic_fn: Python callable that returns the kinetic energy given
-        inverse mass matrix and momentum. If not provided, the default is
-        euclidean kinetic energy.
-    :param str algo: Whether to run ``HMC`` with fixed number of steps or ``NUTS``
-        with adaptive path length. Default is ``NUTS``.
-    :return: a tuple of callables (`init_kernel`, `sample_kernel`), the first
-        one to initialize the sampler, and the second one to generate samples
-        given an existing one.
-
-    .. warning::
-        Instead of using this interface directly, we would highly recommend you
-        to use the higher level :class:`numpyro.infer.MCMC` API instead.
-
-    **Example**
-
-    .. doctest::
-
-        >>> import jax
-        >>> from jax import random
-        >>> import jax.numpy as jnp
-        >>> import numpyro
-        >>> import numpyro.distributions as dist
-        >>> from numpyro.infer.mcmc import hmc
-        >>> from numpyro.infer.util import initialize_model
-        >>> from numpyro.util import fori_collect
-
-        >>> true_coefs = jnp.array([1., 2., 3.])
-        >>> data = random.normal(random.PRNGKey(2), (2000, 3))
-        >>> dim = 3
-        >>> labels = dist.Bernoulli(logits=(true_coefs * data).sum(-1)).sample(random.PRNGKey(3))
-        >>>
-        >>> def model(data, labels):
-        ...     coefs_mean = jnp.zeros(dim)
-        ...     coefs = numpyro.sample('beta', dist.Normal(coefs_mean, jnp.ones(3)))
-        ...     intercept = numpyro.sample('intercept', dist.Normal(0., 10.))
-        ...     return numpyro.sample('y', dist.Bernoulli(logits=(coefs * data + intercept).sum(-1)), obs=labels)
-        >>>
-        >>> model_info = initialize_model(random.PRNGKey(0), model, model_args=(data, labels,))
-        >>> init_kernel, sample_kernel = hmc(model_info.potential_fn, algo='NUTS')
-        >>> hmc_state = init_kernel(model_info.param_info,
-        ...                         trajectory_length=10,
-        ...                         num_warmup=300)
-        >>> samples = fori_collect(0, 500, sample_kernel, hmc_state,
-        ...                        transform=lambda state: model_info.postprocess_fn(state.z))
-        >>> print(jnp.mean(samples['beta'], axis=0))  # doctest: +SKIP
-        [0.9153987 2.0754058 2.9621222]
-    """
-    if kinetic_fn is None:
-        kinetic_fn = euclidean_kinetic_energy
-    vv_update = None
-    trajectory_len = None
-    max_treedepth = None
-    wa_update = None
-    wa_steps = None
-    max_delta_energy = 1000.
-    if algo not in {'HMC', 'NUTS'}:
-        raise ValueError('`algo` must be one of `HMC` or `NUTS`.')
-
-    def init_kernel(init_params,
-                    num_warmup,
-                    step_size=1.0,
-                    inverse_mass_matrix=None,
-                    adapt_step_size=True,
-                    adapt_mass_matrix=True,
-                    dense_mass=False,
-                    target_accept_prob=0.8,
-                    trajectory_length=2*math.pi,
-                    max_tree_depth=10,
-                    find_heuristic_step_size=False,
-                    model_args=(),
-                    model_kwargs=None,
-                    rng_key=random.PRNGKey(0)):
-        """
-        Initializes the HMC sampler.
-
-        :param init_params: Initial parameters to begin sampling. The type must
-            be consistent with the input type to `potential_fn`.
-        :param int num_warmup: Number of warmup steps; samples generated
-            during warmup are discarded.
-        :param float step_size: Determines the size of a single step taken by the
-            verlet integrator while computing the trajectory using Hamiltonian
-            dynamics. If not specified, it will be set to 1.
-        :param numpy.ndarray inverse_mass_matrix: Initial value for inverse mass matrix.
-            This may be adapted during warmup if adapt_mass_matrix = True.
-            If no value is specified, then it is initialized to the identity matrix.
-        :param bool adapt_step_size: A flag to decide if we want to adapt step_size
-            during warm-up phase using Dual Averaging scheme.
-        :param bool adapt_mass_matrix: A flag to decide if we want to adapt mass
-            matrix during warm-up phase using Welford scheme.
-        :param bool dense_mass: A flag to decide if mass matrix is dense or
-            diagonal (default when ``dense_mass=False``)
-        :param float target_accept_prob: Target acceptance probability for step size
-            adaptation using Dual Averaging. Increasing this value will lead to a smaller
-            step size, hence the sampling will be slower but more robust. Default to 0.8.
-        :param float trajectory_length: Length of a MCMC trajectory for HMC. Default
-            value is :math:`2\\pi`.
-        :param int max_tree_depth: Max depth of the binary tree created during the doubling
-            scheme of NUTS sampler. Defaults to 10.
-        :param bool find_heuristic_step_size: whether to a heuristic function to adjust the
-            step size at the beginning of each adaptation window. Defaults to False.
-        :param tuple model_args: Model arguments if `potential_fn_gen` is specified.
-        :param dict model_kwargs: Model keyword arguments if `potential_fn_gen` is specified.
-        :param jax.random.PRNGKey rng_key: random key to be used as the source of
-            randomness.
-
-        """
-        step_size = lax.convert_element_type(step_size, canonicalize_dtype(jnp.float64))
-        nonlocal wa_update, trajectory_len, max_treedepth, vv_update, wa_steps
-        wa_steps = num_warmup
-        trajectory_len = trajectory_length
-        max_treedepth = max_tree_depth
-        if isinstance(init_params, ParamInfo):
-            z, pe, z_grad = init_params
-        else:
-            z, pe, z_grad = init_params, None, None
-        pe_fn = potential_fn
-        if potential_fn_gen:
-            if pe_fn is not None:
-                raise ValueError('Only one of `potential_fn` or `potential_fn_gen` must be provided.')
-            else:
-                kwargs = {} if model_kwargs is None else model_kwargs
-                pe_fn = potential_fn_gen(*model_args, **kwargs)
-
-        find_reasonable_ss = None
-        if find_heuristic_step_size:
-            find_reasonable_ss = partial(find_reasonable_step_size,
-                                         pe_fn,
-                                         kinetic_fn,
-                                         momentum_generator)
-
-        wa_init, wa_update = warmup_adapter(num_warmup,
-                                            adapt_step_size=adapt_step_size,
-                                            adapt_mass_matrix=adapt_mass_matrix,
-                                            dense_mass=dense_mass,
-                                            target_accept_prob=target_accept_prob,
-                                            find_reasonable_step_size=find_reasonable_ss)
-
-        rng_key_hmc, rng_key_wa, rng_key_momentum = random.split(rng_key, 3)
-        wa_state = wa_init(z, rng_key_wa, step_size,
-                           inverse_mass_matrix=inverse_mass_matrix,
-                           mass_matrix_size=jnp.size(ravel_pytree(z)[0]))
-        r = momentum_generator(z, wa_state.mass_matrix_sqrt, rng_key_momentum)
-        vv_init, vv_update = velocity_verlet(pe_fn, kinetic_fn)
-        vv_state = vv_init(z, r, potential_energy=pe, z_grad=z_grad)
-        energy = kinetic_fn(wa_state.inverse_mass_matrix, vv_state.r)
-        hmc_state = HMCState(0, vv_state.z, vv_state.z_grad, vv_state.potential_energy, energy,
-                             0, 0., 0., False, wa_state, rng_key_hmc)
-        return device_put(hmc_state)
-
-    def _hmc_next(step_size, inverse_mass_matrix, vv_state,
-                  model_args, model_kwargs, rng_key):
-        if potential_fn_gen:
-            nonlocal vv_update
-            pe_fn = potential_fn_gen(*model_args, **model_kwargs)
-            _, vv_update = velocity_verlet(pe_fn, kinetic_fn)
-
-        num_steps = _get_num_steps(step_size, trajectory_len)
-        vv_state_new = fori_loop(0, num_steps,
-                                 lambda i, val: vv_update(step_size, inverse_mass_matrix, val),
-                                 vv_state)
-        energy_old = vv_state.potential_energy + kinetic_fn(inverse_mass_matrix, vv_state.r)
-        energy_new = vv_state_new.potential_energy + kinetic_fn(inverse_mass_matrix, vv_state_new.r)
-        delta_energy = energy_new - energy_old
-        delta_energy = jnp.where(jnp.isnan(delta_energy), jnp.inf, delta_energy)
-        accept_prob = jnp.clip(jnp.exp(-delta_energy), a_max=1.0)
-        diverging = delta_energy > max_delta_energy
-        transition = random.bernoulli(rng_key, accept_prob)
-        vv_state, energy = cond(transition,
-                                (vv_state_new, energy_new), identity,
-                                (vv_state, energy_old), identity)
-        return vv_state, energy, num_steps, accept_prob, diverging
-
-    def _nuts_next(step_size, inverse_mass_matrix, vv_state,
-                   model_args, model_kwargs, rng_key):
-        if potential_fn_gen:
-            nonlocal vv_update
-            pe_fn = potential_fn_gen(*model_args, **model_kwargs)
-            _, vv_update = velocity_verlet(pe_fn, kinetic_fn)
-
-        binary_tree = build_tree(vv_update, kinetic_fn, vv_state,
-                                 inverse_mass_matrix, step_size, rng_key,
-                                 max_delta_energy=max_delta_energy,
-                                 max_tree_depth=max_treedepth)
-        accept_prob = binary_tree.sum_accept_probs / binary_tree.num_proposals
-        num_steps = binary_tree.num_proposals
-        vv_state = IntegratorState(z=binary_tree.z_proposal,
-                                   r=vv_state.r,
-                                   potential_energy=binary_tree.z_proposal_pe,
-                                   z_grad=binary_tree.z_proposal_grad)
-        return vv_state, binary_tree.z_proposal_energy, num_steps, accept_prob, binary_tree.diverging
-
-    _next = _nuts_next if algo == 'NUTS' else _hmc_next
-
-    def sample_kernel(hmc_state, model_args=(), model_kwargs=None):
-        """
-        Given an existing :data:`~numpyro.infer.mcmc.HMCState`, run HMC with fixed (possibly adapted)
-        step size and return a new :data:`~numpyro.infer.mcmc.HMCState`.
-
-        :param hmc_state: Current sample (and associated state).
-        :param tuple model_args: Model arguments if `potential_fn_gen` is specified.
-        :param dict model_kwargs: Model keyword arguments if `potential_fn_gen` is specified.
-        :return: new proposed :data:`~numpyro.infer.mcmc.HMCState` from simulating
-            Hamiltonian dynamics given existing state.
-
-        """
-        model_kwargs = {} if model_kwargs is None else model_kwargs
-        rng_key, rng_key_momentum, rng_key_transition = random.split(hmc_state.rng_key, 3)
-        r = momentum_generator(hmc_state.z, hmc_state.adapt_state.mass_matrix_sqrt, rng_key_momentum)
-        vv_state = IntegratorState(hmc_state.z, r, hmc_state.potential_energy, hmc_state.z_grad)
-        vv_state, energy, num_steps, accept_prob, diverging = _next(hmc_state.adapt_state.step_size,
-                                                                    hmc_state.adapt_state.inverse_mass_matrix,
-                                                                    vv_state,
-                                                                    model_args,
-                                                                    model_kwargs,
-                                                                    rng_key_transition)
-        # not update adapt_state after warmup phase
-        adapt_state = cond(hmc_state.i < wa_steps,
-                           (hmc_state.i, accept_prob, vv_state.z, hmc_state.adapt_state),
-                           lambda args: wa_update(*args),
-                           hmc_state.adapt_state,
-                           identity)
-
-        itr = hmc_state.i + 1
-        n = jnp.where(hmc_state.i < wa_steps, itr, itr - wa_steps)
-        mean_accept_prob = hmc_state.mean_accept_prob + (accept_prob - hmc_state.mean_accept_prob) / n
-
-        return HMCState(itr, vv_state.z, vv_state.z_grad, vv_state.potential_energy, energy, num_steps,
-                        accept_prob, mean_accept_prob, diverging, adapt_state, rng_key)
-
-    # Make `init_kernel` and `sample_kernel` visible from the global scope once
-    # `hmc` is called for sphinx doc generation.
-    if 'SPHINX_BUILD' in os.environ:
-        hmc.init_kernel = init_kernel
-        hmc.sample_kernel = sample_kernel
-
-    return init_kernel, sample_kernel
-
-
 class MCMCKernel(ABC):
     """
     Defines the interface for the Markov transition kernel that is
     used for :class:`~numpyro.infer.MCMC` inference.
+
+    **Example:**
+
+    .. doctest::
+
+        >>> from collections import namedtuple
+        >>> from jax import random
+        >>> import jax.numpy as jnp
+        >>> import numpyro
+        >>> import numpyro.distributions as dist
+        >>> from numpyro.infer import MCMC
+
+        >>> MHState = namedtuple("MHState", ["z", "rng_key"])
+
+        >>> class MetropolisHastings(numpyro.infer.mcmc.MCMCKernel):
+        ...     sample_field = "z"
+        ...
+        ...     def __init__(self, potential_fn, step_size=0.1):
+        ...         self.potential_fn = potential_fn
+        ...         self.step_size = step_size
+        ...
+        ...     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
+        ...         return MHState(init_params, rng_key)
+        ...
+        ...     def sample(self, state, model_args, model_kwargs):
+        ...         z, rng_key = state
+        ...         rng_key, key_proposal, key_accept = random.split(rng_key, 3)
+        ...         z_proposal = dist.Normal(z, self.step_size).sample(key_proposal)
+        ...         accept_prob = jnp.exp(self.potential_fn(z) - self.potential_fn(z_proposal))
+        ...         z_new = jnp.where(dist.Uniform().sample(key_accept) < accept_prob, z_proposal, z)
+        ...         return MHState(z_new, rng_key)
+
+        >>> def f(x):
+        ...     return ((x - 2) ** 2).sum()
+
+        >>> kernel = MetropolisHastings(f)
+        >>> mcmc = MCMC(kernel, num_warmup=1000, num_samples=1000)
+        >>> mcmc.run(random.PRNGKey(0), init_params=jnp.array([1., 2.]))
+        >>> samples = mcmc.get_samples()
     """
     def postprocess_fn(self, model_args, model_kwargs):
         """
-        Function that transforms unconstrained values at sample sites to values
+        Get a function that transforms unconstrained values at sample sites to values
         constrained to the site's support, in addition to returning deterministic
         sites in the model.
 
@@ -390,6 +107,9 @@ class MCMCKernel(ABC):
             be consistent with the input type to `potential_fn`.
         :param model_args: Arguments provided to the model.
         :param model_kwargs: Keyword arguments provided to the model.
+        :return: The initial state representing the state of the kernel. This can be
+            any class that is registered as a
+            `pytree <https://jax.readthedocs.io/en/latest/pytrees.html>`_.
         """
         raise NotImplementedError
 
@@ -399,532 +119,40 @@ class MCMCKernel(ABC):
         Given the current `state`, return the next `state` using the given
         transition kernel.
 
-        :param state: Arbitrary data structure representing the state for the
-            kernel. For HMC, this is given by :data:`~numpyro.infer.mcmc.HMCState`.
+        :param state: A `pytree <https://jax.readthedocs.io/en/latest/pytrees.html>`_
+            class representing the state for the kernel. For HMC, this is given
+            by :data:`~numpyro.infer.hmc.HMCState`. In general, this could be any
+            class that supports `getattr`.
         :param model_args: Arguments provided to the model.
         :param model_kwargs: Keyword arguments provided to the model.
         :return: Next `state`.
         """
         raise NotImplementedError
 
-
-class HMC(MCMCKernel):
-    """
-    Hamiltonian Monte Carlo inference, using fixed trajectory length, with
-    provision for step size and mass matrix adaptation.
-
-    **References:**
-
-    1. *MCMC Using Hamiltonian Dynamics*,
-       Radford M. Neal
-
-    :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
-        If model is provided, `potential_fn` will be inferred using the model.
-    :param potential_fn: Python callable that computes the potential energy
-        given input parameters. The input parameters to `potential_fn` can be
-        any python collection type, provided that `init_params` argument to
-        `init_kernel` has the same type.
-    :param kinetic_fn: Python callable that returns the kinetic energy given
-        inverse mass matrix and momentum. If not provided, the default is
-        euclidean kinetic energy.
-    :param float step_size: Determines the size of a single step taken by the
-        verlet integrator while computing the trajectory using Hamiltonian
-        dynamics. If not specified, it will be set to 1.
-    :param bool adapt_step_size: A flag to decide if we want to adapt step_size
-        during warm-up phase using Dual Averaging scheme.
-    :param bool adapt_mass_matrix: A flag to decide if we want to adapt mass
-        matrix during warm-up phase using Welford scheme.
-    :param bool dense_mass:  A flag to decide if mass matrix is dense or
-        diagonal (default when ``dense_mass=False``)
-    :param float target_accept_prob: Target acceptance probability for step size
-        adaptation using Dual Averaging. Increasing this value will lead to a smaller
-        step size, hence the sampling will be slower but more robust. Default to 0.8.
-    :param float trajectory_length: Length of a MCMC trajectory for HMC. Default
-        value is :math:`2\\pi`.
-    :param callable init_strategy: a per-site initialization function.
-        See :ref:`init_strategy` section for available functions.
-    :param bool find_heuristic_step_size: whether to a heuristic function to adjust the
-        step size at the beginning of each adaptation window. Defaults to False.
-    """
-    def __init__(self,
-                 model=None,
-                 potential_fn=None,
-                 kinetic_fn=None,
-                 step_size=1.0,
-                 adapt_step_size=True,
-                 adapt_mass_matrix=True,
-                 dense_mass=False,
-                 target_accept_prob=0.8,
-                 trajectory_length=2 * math.pi,
-                 init_strategy=init_to_uniform,
-                 find_heuristic_step_size=False):
-        if not (model is None) ^ (potential_fn is None):
-            raise ValueError('Only one of `model` or `potential_fn` must be specified.')
-        self._model = model
-        self._potential_fn = potential_fn
-        self._kinetic_fn = kinetic_fn if kinetic_fn is not None else euclidean_kinetic_energy
-        self._step_size = step_size
-        self._adapt_step_size = adapt_step_size
-        self._adapt_mass_matrix = adapt_mass_matrix
-        self._dense_mass = dense_mass
-        self._target_accept_prob = target_accept_prob
-        self._trajectory_length = trajectory_length
-        self._algo = 'HMC'
-        self._max_tree_depth = 10
-        self._init_strategy = init_strategy
-        self._find_heuristic_step_size = find_heuristic_step_size
-        # Set on first call to init
-        self._init_fn = None
-        self._postprocess_fn = None
-        self._sample_fn = None
-
-    def _init_state(self, rng_key, model_args, model_kwargs, init_params):
-        if self._model is not None:
-            init_params, potential_fn, postprocess_fn, model_trace = initialize_model(
-                rng_key,
-                self._model,
-                dynamic_args=True,
-                model_args=model_args,
-                model_kwargs=model_kwargs)
-            if any(v['type'] == 'param' for v in model_trace.values()):
-                warnings.warn("'param' sites will be treated as constants during inference. To define "
-                              "an improper variable, please use a 'sample' site with log probability "
-                              "masked out. For example, `sample('x', dist.LogNormal(0, 1).mask(False)` "
-                              "means that `x` has improper distribution over the positive domain.")
-            if self._init_fn is None:
-                self._init_fn, self._sample_fn = hmc(potential_fn_gen=potential_fn,
-                                                     kinetic_fn=self._kinetic_fn,
-                                                     algo=self._algo)
-            self._postprocess_fn = postprocess_fn
-        elif self._init_fn is None:
-            self._init_fn, self._sample_fn = hmc(potential_fn=self._potential_fn,
-                                                 kinetic_fn=self._kinetic_fn,
-                                                 algo=self._algo)
-
-        return init_params
+    @property
+    def sample_field(self):
+        """
+        The attribute of the `state` object passed to :meth:`sample` that denotes
+        the MCMC sample. This is used by :meth:`postprocess_fn` and for reporting
+        results in :meth:`MCMC.print_summary()
+        <numpyro.infer.mcmc.MCMC.print_summary>`.
+        """
+        raise NotImplementedError
 
     @property
-    def model(self):
-        return self._model
-
-    @copy_docs_from(MCMCKernel.init)
-    def init(self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}):
-        # non-vectorized
-        if rng_key.ndim == 1:
-            rng_key, rng_key_init_model = random.split(rng_key)
-        # vectorized
-        else:
-            rng_key, rng_key_init_model = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
-        init_params = self._init_state(rng_key_init_model, model_args, model_kwargs, init_params)
-        if self._potential_fn and init_params is None:
-            raise ValueError('Valid value of `init_params` must be provided with'
-                             ' `potential_fn`.')
-
-        hmc_init_fn = lambda init_params, rng_key: self._init_fn(  # noqa: E731
-            init_params,
-            num_warmup=num_warmup,
-            step_size=self._step_size,
-            adapt_step_size=self._adapt_step_size,
-            adapt_mass_matrix=self._adapt_mass_matrix,
-            dense_mass=self._dense_mass,
-            target_accept_prob=self._target_accept_prob,
-            trajectory_length=self._trajectory_length,
-            max_tree_depth=self._max_tree_depth,
-            find_heuristic_step_size=self._find_heuristic_step_size,
-            model_args=model_args,
-            model_kwargs=model_kwargs,
-            rng_key=rng_key,
-        )
-        if rng_key.ndim == 1:
-            init_state = hmc_init_fn(init_params, rng_key)
-        else:
-            # XXX it is safe to run hmc_init_fn under vmap despite that hmc_init_fn changes some
-            # nonlocal variables: momentum_generator, wa_update, trajectory_len, max_treedepth,
-            # wa_steps because those variables do not depend on traced args: init_params, rng_key.
-            init_state = vmap(hmc_init_fn)(init_params, rng_key)
-            sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
-            self._sample_fn = sample_fn
-        return init_state
-
-    @copy_docs_from(MCMCKernel.postprocess_fn)
-    def postprocess_fn(self, args, kwargs):
-        if self._postprocess_fn is None:
-            return identity
-        return self._postprocess_fn(*args, **kwargs)
-
-    def sample(self, state, model_args, model_kwargs):
+    def default_fields(self):
         """
-        Run HMC from the given :data:`~numpyro.infer.mcmc.HMCState` and return the resulting
-        :data:`~numpyro.infer.mcmc.HMCState`.
-
-        :param HMCState state: Represents the current state.
-        :param model_args: Arguments provided to the model.
-        :param model_kwargs: Keyword arguments provided to the model.
-        :return: Next `state` after running HMC.
+        The attributes of the `state` object to be collected by default during
+        the MCMC run (when :meth:`MCMC.run() <numpyro.infer.MCMC.run>` is called).
         """
-        return self._sample_fn(state, model_args, model_kwargs)
+        return (self.sample_field,)
 
-
-class NUTS(HMC):
-    """
-    Hamiltonian Monte Carlo inference, using the No U-Turn Sampler (NUTS)
-    with adaptive path length and mass matrix adaptation.
-
-    **References:**
-
-    1. *MCMC Using Hamiltonian Dynamics*,
-       Radford M. Neal
-    2. *The No-U-turn sampler: adaptively setting path lengths in Hamiltonian Monte Carlo*,
-       Matthew D. Hoffman, and Andrew Gelman.
-    3. *A Conceptual Introduction to Hamiltonian Monte Carlo`*,
-       Michael Betancourt
-
-    :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
-        If model is provided, `potential_fn` will be inferred using the model.
-    :param potential_fn: Python callable that computes the potential energy
-        given input parameters. The input parameters to `potential_fn` can be
-        any python collection type, provided that `init_params` argument to
-        `init_kernel` has the same type.
-    :param kinetic_fn: Python callable that returns the kinetic energy given
-        inverse mass matrix and momentum. If not provided, the default is
-        euclidean kinetic energy.
-    :param float step_size: Determines the size of a single step taken by the
-        verlet integrator while computing the trajectory using Hamiltonian
-        dynamics. If not specified, it will be set to 1.
-    :param bool adapt_step_size: A flag to decide if we want to adapt step_size
-        during warm-up phase using Dual Averaging scheme.
-    :param bool adapt_mass_matrix: A flag to decide if we want to adapt mass
-        matrix during warm-up phase using Welford scheme.
-    :param bool dense_mass:  A flag to decide if mass matrix is dense or
-        diagonal (default when ``dense_mass=False``)
-    :param float target_accept_prob: Target acceptance probability for step size
-        adaptation using Dual Averaging. Increasing this value will lead to a smaller
-        step size, hence the sampling will be slower but more robust. Default to 0.8.
-    :param float trajectory_length: Length of a MCMC trajectory for HMC. This arg has
-        no effect in NUTS sampler.
-    :param int max_tree_depth: Max depth of the binary tree created during the doubling
-        scheme of NUTS sampler. Defaults to 10.
-    :param callable init_strategy: a per-site initialization function.
-        See :ref:`init_strategy` section for available functions.
-    :param bool find_heuristic_step_size: whether to a heuristic function to adjust the
-        step size at the beginning of each adaptation window. Defaults to False.
-    """
-    def __init__(self,
-                 model=None,
-                 potential_fn=None,
-                 kinetic_fn=None,
-                 step_size=1.0,
-                 adapt_step_size=True,
-                 adapt_mass_matrix=True,
-                 dense_mass=False,
-                 target_accept_prob=0.8,
-                 trajectory_length=None,
-                 max_tree_depth=10,
-                 init_strategy=init_to_uniform,
-                 find_heuristic_step_size=False):
-        super(NUTS, self).__init__(potential_fn=potential_fn, model=model, kinetic_fn=kinetic_fn,
-                                   step_size=step_size, adapt_step_size=adapt_step_size,
-                                   adapt_mass_matrix=adapt_mass_matrix, dense_mass=dense_mass,
-                                   target_accept_prob=target_accept_prob,
-                                   trajectory_length=trajectory_length,
-                                   init_strategy=init_strategy,
-                                   find_heuristic_step_size=find_heuristic_step_size)
-        self._max_tree_depth = max_tree_depth
-        self._algo = 'NUTS'
-
-
-def _get_proposal_loc_and_scale(samples, loc, scale, new_sample):
-    # get loc/scale of q_{-n} (Algorithm 1, line 5 of ref [1]) for n from 1 -> N
-    # these loc/scale will be stacked to the first dim; so
-    #   proposal_loc.shape[0] = proposal_loc.shape[0] = N
-    # Here, we use the numerical stability procedure in Appendix 6 of [1].
-    weight = 1 / samples.shape[0]
-    if scale.ndim > loc.ndim:
-        new_scale = cholesky_update(scale, new_sample - loc, weight)
-        proposal_scale = cholesky_update(new_scale, samples - loc, -weight)
-        proposal_scale = cholesky_update(proposal_scale, new_sample - samples, - (weight ** 2))
-    else:
-        var = jnp.square(scale) + weight * jnp.square(new_sample - loc)
-        proposal_var = var - weight * jnp.square(samples - loc)
-        proposal_var = proposal_var - weight ** 2 * jnp.square(new_sample - samples)
-        proposal_scale = jnp.sqrt(proposal_var)
-
-    proposal_loc = loc + weight * (new_sample - samples)
-    return proposal_loc, proposal_scale
-
-
-def _sample_proposal(inv_mass_matrix_sqrt, rng_key, batch_shape=()):
-    eps = random.normal(rng_key, batch_shape + jnp.shape(inv_mass_matrix_sqrt)[:1])
-    if inv_mass_matrix_sqrt.ndim == 1:
-        r = jnp.multiply(inv_mass_matrix_sqrt, eps)
-    elif inv_mass_matrix_sqrt.ndim == 2:
-        r = jnp.matmul(inv_mass_matrix_sqrt, eps[..., None])[..., 0]
-    else:
-        raise ValueError("Mass matrix has incorrect number of dims.")
-    return r
-
-
-# XXX: probably we need to recompute `loc`, `inv_mass_matrix_sqrt` from `zs`
-# because we might lose precision after many iterations of using _get_proposal_loc_and_scale;
-# If we recompute, we don't need to store `loc` and `inv_mass_matrix_sqrt` here.
-# We may also update those values every 10D iterations...
-SAAdaptState = namedtuple('SAAdaptState', ['zs', 'pes', 'loc', 'inv_mass_matrix_sqrt'])
-SAState = namedtuple('SAState', ['i', 'z', 'potential_energy', 'accept_prob',
-                                 'mean_accept_prob', 'diverging', 'adapt_state', 'rng_key'])
-"""
-A :func:`~collections.namedtuple` used in Sample Adaptive MCMC.
-This consists of the following fields:
-
- - **i** - iteration. This is reset to 0 after warmup.
- - **z** - Python collection representing values (unconstrained samples from
-   the posterior) at latent sites.
- - **potential_energy** - Potential energy computed at the given value of ``z``.
- - **accept_prob** - Acceptance probability of the proposal. Note that ``z``
-   does not correspond to the proposal if it is rejected.
- - **mean_accept_prob** - Mean acceptance probability until current iteration
-   during warmup or sampling (for diagnostics).
- - **diverging** - A boolean value to indicate whether the new sample potential energy
-   is diverging from the current one.
- - **adapt_state** - A ``SAAdaptState`` namedtuple which contains adaptation information:
-
-   + **zs** - Step size to be used by the integrator in the next iteration.
-   + **pes** - Potential energies of `zs`.
-   + **loc** - Mean of those `zs`.
-   + **inv_mass_matrix_sqrt** - If using dense mass matrix, this is Cholesky of the
-     covariance of `zs`. Otherwise, this is standard deviation of those `zs`.
-
- - **rng_key** - random number generator seed used for the iteration.
-"""
-
-
-def _numpy_delete(x, idx):
-    """
-    Gets the subarray from `x` where data from index `idx` on the first axis is removed.
-    """
-    # NB: numpy.delete is not yet available in JAX
-    mask = jnp.arange(x.shape[0] - 1) < idx
-    return jnp.where(mask.reshape((-1,) + (1,) * (x.ndim - 1)), x[:-1], x[1:])
-
-
-# TODO: consider to expose this functional style
-def _sa(potential_fn=None, potential_fn_gen=None):
-    wa_steps = None
-    max_delta_energy = 1000.
-
-    def init_kernel(init_params,
-                    num_warmup,
-                    adapt_state_size=None,
-                    inverse_mass_matrix=None,
-                    dense_mass=False,
-                    model_args=(),
-                    model_kwargs=None,
-                    rng_key=random.PRNGKey(0)):
-        nonlocal wa_steps
-        wa_steps = num_warmup
-        pe_fn = potential_fn
-        if potential_fn_gen:
-            if pe_fn is not None:
-                raise ValueError('Only one of `potential_fn` or `potential_fn_gen` must be provided.')
-            else:
-                kwargs = {} if model_kwargs is None else model_kwargs
-                pe_fn = potential_fn_gen(*model_args, **kwargs)
-        rng_key_sa, rng_key_zs, rng_key_z = random.split(rng_key, 3)
-        z = init_params
-        z_flat, unravel_fn = ravel_pytree(z)
-        if inverse_mass_matrix is None:
-            inverse_mass_matrix = jnp.identity(z_flat.shape[-1]) if dense_mass else jnp.ones(z_flat.shape[-1])
-        inv_mass_matrix_sqrt = jnp.linalg.cholesky(inverse_mass_matrix) if dense_mass \
-            else jnp.sqrt(inverse_mass_matrix)
-        if adapt_state_size is None:
-            # XXX: heuristic choice
-            adapt_state_size = 2 * z_flat.shape[-1]
-        else:
-            assert adapt_state_size > 1, 'adapt_state_size should be greater than 1.'
-        # NB: mean is init_params
-        zs = z_flat + _sample_proposal(inv_mass_matrix_sqrt, rng_key_zs, (adapt_state_size,))
-        # compute potential energies
-        pes = lax.map(lambda z: pe_fn(unravel_fn(z)), zs)
-        if dense_mass:
-            cov = jnp.cov(zs, rowvar=False, bias=True)
-            if cov.shape == ():  # JAX returns scalar for 1D input
-                cov = cov.reshape((1, 1))
-            inv_mass_matrix_sqrt = jnp.linalg.cholesky(cov)
-        else:
-            inv_mass_matrix_sqrt = jnp.std(zs, 0)
-        adapt_state = SAAdaptState(zs, pes, jnp.mean(zs, 0), inv_mass_matrix_sqrt)
-        k = random.categorical(rng_key_z, jnp.zeros(zs.shape[0]))
-        z = unravel_fn(zs[k])
-        pe = pes[k]
-        sa_state = SAState(0, z, pe, 0., 0., False, adapt_state, rng_key_sa)
-        return device_put(sa_state)
-
-    def sample_kernel(sa_state, model_args=(), model_kwargs=None):
-        pe_fn = potential_fn
-        if potential_fn_gen:
-            pe_fn = potential_fn_gen(*model_args, **model_kwargs)
-        zs, pes, loc, scale = sa_state.adapt_state
-        rng_key, rng_key_z, rng_key_reject, rng_key_accept = random.split(sa_state.rng_key, 4)
-        _, unravel_fn = ravel_pytree(sa_state.z)
-
-        z = loc + _sample_proposal(scale, rng_key_z)
-        pe = pe_fn(unravel_fn(z))
-        pe = jnp.where(jnp.isnan(pe), jnp.inf, pe)
-        diverging = (pe - sa_state.potential_energy) > max_delta_energy
-
-        # NB: all terms having the pattern *s will have shape N x ...
-        # and all terms having the pattern *s_ will have shape (N + 1) x ...
-        locs, scales = _get_proposal_loc_and_scale(zs, loc, scale, z)
-        zs_ = jnp.concatenate([zs, z[None, :]])
-        pes_ = jnp.concatenate([pes, pe[None]])
-        locs_ = jnp.concatenate([locs, loc[None, :]])
-        scales_ = jnp.concatenate([scales, scale[None, ...]])
-        if scale.ndim == 2:  # dense_mass
-            log_weights_ = dist.MultivariateNormal(locs_, scale_tril=scales_).log_prob(zs_) + pes_
-        else:
-            log_weights_ = dist.Normal(locs_, scales_).log_prob(zs_).sum(-1) + pes_
-        log_weights_ = jnp.where(jnp.isnan(log_weights_), -jnp.inf, log_weights_)
-        # get rejecting index
-        j = random.categorical(rng_key_reject, log_weights_)
-        zs = _numpy_delete(zs_, j)
-        pes = _numpy_delete(pes_, j)
-        loc = locs_[j]
-        scale = scales_[j]
-        adapt_state = SAAdaptState(zs, pes, loc, scale)
-
-        # NB: weights[-1] / sum(weights) is the probability of rejecting the new sample `z`.
-        accept_prob = 1 - jnp.exp(log_weights_[-1] - logsumexp(log_weights_))
-        itr = sa_state.i + 1
-        n = jnp.where(sa_state.i < wa_steps, itr, itr - wa_steps)
-        mean_accept_prob = sa_state.mean_accept_prob + (accept_prob - sa_state.mean_accept_prob) / n
-
-        # XXX: we make a modification of SA sampler in [1]
-        # in [1], each MCMC state contains N points `zs`
-        # here we do resampling to pick randomly a point from those N points
-        k = random.categorical(rng_key_accept, jnp.zeros(zs.shape[0]))
-        z = unravel_fn(zs[k])
-        pe = pes[k]
-        return SAState(itr, z, pe, accept_prob, mean_accept_prob, diverging, adapt_state, rng_key)
-
-    return init_kernel, sample_kernel
-
-
-# TODO: this shares almost the same code as HMC, so we can abstract out much of the implementation
-class SA(MCMCKernel):
-    """
-    Sample Adaptive MCMC, a gradient-free sampler.
-
-    This is a very fast (in term of n_eff / s) sampler but requires
-    many warmup (burn-in) steps. In each MCMC step, we only need to
-    evaluate potential function at one point.
-
-    Note that unlike in reference [1], we return a randomly selected (i.e. thinned)
-    subset of approximate posterior samples of size num_chains x num_samples
-    instead of num_chains x num_samples x adapt_state_size.
-
-    .. note:: We recommend to use this kernel with `progress_bar=False` in :class:`MCMC`
-        to reduce JAX's dispatch overhead.
-
-    **References:**
-
-    1. *Sample Adaptive MCMC* (https://papers.nips.cc/paper/9107-sample-adaptive-mcmc),
-       Michael Zhu
-
-    :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
-        If model is provided, `potential_fn` will be inferred using the model.
-    :param potential_fn: Python callable that computes the potential energy
-        given input parameters. The input parameters to `potential_fn` can be
-        any python collection type, provided that `init_params` argument to
-        `init_kernel` has the same type.
-    :param int adapt_state_size: The number of points to generate proposal
-        distribution. Defaults to 2 times latent size.
-    :param bool dense_mass:  A flag to decide if mass matrix is dense or
-        diagonal (default to ``dense_mass=True``)
-    :param callable init_strategy: a per-site initialization function.
-        See :ref:`init_strategy` section for available functions.
-    """
-    def __init__(self, model=None, potential_fn=None, adapt_state_size=None,
-                 dense_mass=True, init_strategy=init_to_uniform):
-        if not (model is None) ^ (potential_fn is None):
-            raise ValueError('Only one of `model` or `potential_fn` must be specified.')
-        self._model = model
-        self._potential_fn = potential_fn
-        self._adapt_state_size = adapt_state_size
-        self._dense_mass = dense_mass
-        self._init_strategy = init_strategy
-        self._init_fn = None
-        self._postprocess_fn = None
-        self._sample_fn = None
-
-    def _init_state(self, rng_key, model_args, model_kwargs, init_params):
-        if self._model is not None:
-            init_params, potential_fn, postprocess_fn, _ = initialize_model(
-                rng_key,
-                self._model,
-                dynamic_args=True,
-                model_args=model_args,
-                model_kwargs=model_kwargs)
-            init_params = init_params[0]
-            # NB: init args is different from HMC
-            self._init_fn, sample_fn = _sa(potential_fn_gen=potential_fn)
-            if self._postprocess_fn is None:
-                self._postprocess_fn = postprocess_fn
-        else:
-            self._init_fn, sample_fn = _sa(potential_fn=self._potential_fn)
-
-        if self._sample_fn is None:
-            self._sample_fn = sample_fn
-        return init_params
-
-    @copy_docs_from(MCMCKernel.init)
-    def init(self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}):
-        # non-vectorized
-        if rng_key.ndim == 1:
-            rng_key, rng_key_init_model = random.split(rng_key)
-        # vectorized
-        else:
-            rng_key, rng_key_init_model = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
-            # we need only a single key for initializing PE / constraints fn
-            rng_key_init_model = rng_key_init_model[0]
-        init_params = self._init_state(rng_key_init_model, model_args, model_kwargs, init_params)
-        if self._potential_fn and init_params is None:
-            raise ValueError('Valid value of `init_params` must be provided with'
-                             ' `potential_fn`.')
-
-        # NB: init args is different from HMC
-        sa_init_fn = lambda init_params, rng_key: self._init_fn(  # noqa: E731
-            init_params,
-            num_warmup=num_warmup,
-            adapt_state_size=self._adapt_state_size,
-            dense_mass=self._dense_mass,
-            rng_key=rng_key,
-            model_args=model_args,
-            model_kwargs=model_kwargs,
-        )
-        if rng_key.ndim == 1:
-            init_state = sa_init_fn(init_params, rng_key)
-        else:
-            init_state = vmap(sa_init_fn)(init_params, rng_key)
-            sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
-            self._sample_fn = sample_fn
-        return init_state
-
-    @copy_docs_from(MCMCKernel.postprocess_fn)
-    def postprocess_fn(self, args, kwargs):
-        if self._postprocess_fn is None:
-            return identity
-        return self._postprocess_fn(*args, **kwargs)
-
-    def sample(self, state, model_args, model_kwargs):
+    def get_diagnostics_str(self, state):
         """
-        Run SA from the given :data:`~numpyro.infer.mcmc.SAState` and return the resulting
-        :data:`~numpyro.infer.mcmc.SAState`.
-
-        :param SAState state: Represents the current state.
-        :param model_args: Arguments provided to the model.
-        :param model_kwargs: Keyword arguments provided to the model.
-        :return: Next `state` after running SA.
+        Given the current `state`, returns the diagnostics string to
+        be added to progress bar for diagnostics purpose.
         """
-        return self._sample_fn(state, model_args, model_kwargs)
+        return ''
 
 
 def _get_value_from_index(xs, i):
@@ -955,7 +183,10 @@ def _sample_fn_nojit_args(state, sampler, args, kwargs):
 def _collect_fn(collect_fields):
     @cached_by(_collect_fn, collect_fields)
     def collect(x):
-        return attrgetter(*collect_fields)(x[0])
+        if collect_fields:
+            return attrgetter(*collect_fields)(x[0])
+        else:
+            return x[0]
 
     return collect
 
@@ -1013,10 +244,15 @@ class MCMC(object):
                  progress_bar=True,
                  jit_model_args=False):
         self.sampler = sampler
+        self._sample_field = sampler.sample_field
+        self._default_fields = sampler.default_fields
         self.num_warmup = num_warmup
         self.num_samples = num_samples
         self.num_chains = num_chains
         self.postprocess_fn = postprocess_fn
+        if chain_method not in ['parallel', 'vectorized', 'sequential']:
+            raise ValueError('Only supporting the following methods to draw chains:'
+                             ' "sequential", "parallel", or "vectorized"')
         self.chain_method = chain_method
         self.progress_bar = progress_bar
         # TODO: We should have progress bars (maybe without diagnostics) for num_chains > 1
@@ -1070,7 +306,8 @@ class MCMC(object):
         except TypeError:
             return None
 
-    def _single_chain_mcmc(self, rng_key, init_state, init_params, args, kwargs, collect_fields=('z',)):
+    def _single_chain_mcmc(self, init, args, kwargs, collect_fields):
+        rng_key, init_state, init_params = init
         if init_state is None:
             init_state = self.sampler.init(rng_key, self.num_warmup, init_params,
                                            model_args=args, model_kwargs=kwargs)
@@ -1078,7 +315,7 @@ class MCMC(object):
             postprocess_fn = self.sampler.postprocess_fn(args, kwargs)
         else:
             postprocess_fn = self.postprocess_fn
-        diagnostics = lambda x: get_diagnostics_str(x[0]) if rng_key.ndim == 1 else None   # noqa: E731
+        diagnostics = lambda x: self.sampler.get_diagnostics_str(x[0]) if rng_key.ndim == 1 else ''   # noqa: E731
         init_val = (init_state, args, kwargs) if self._jit_model_args else (init_state,)
         lower_idx = self._collection_params["lower"]
         upper_idx = self._collection_params["upper"]
@@ -1091,8 +328,7 @@ class MCMC(object):
                                     progbar=self.progress_bar,
                                     return_last_val=True,
                                     collection_size=self._collection_params["collection_size"],
-                                    progbar_desc=functools.partial(get_progbar_desc_str,
-                                                                   lower_idx),
+                                    progbar_desc=partial(get_progbar_desc_str, lower_idx),
                                     diagnostics_fn=diagnostics)
         states, last_val = collect_vals
         # Get first argument of type `HMCState`
@@ -1101,16 +337,10 @@ class MCMC(object):
             states = (states,)
         states = dict(zip(collect_fields, states))
         # Apply constraints if number of samples is non-zero
-        site_values = tree_flatten(states['z'])[0]
+        site_values = tree_flatten(states[self._sample_field])[0]
         if len(site_values) > 0 and site_values[0].size > 0:
-            states['z'] = lax.map(postprocess_fn, states['z'])
+            states[self._sample_field] = lax.map(postprocess_fn, states[self._sample_field])
         return states, last_state
-
-    def _single_chain_jit_args(self, init, collect_fields=('z',)):
-        return self._single_chain_mcmc(*init, collect_fields=collect_fields)
-
-    def _single_chain_nojit_args(self, init, model_args, model_kwargs, collect_fields=('z',)):
-        return self._single_chain_mcmc(*init, model_args, model_kwargs, collect_fields=collect_fields)
 
     def _set_collection_params(self, lower=None, upper=None, collection_size=None):
         self._collection_params["lower"] = self.num_warmup if lower is None else lower
@@ -1139,8 +369,9 @@ class MCMC(object):
         :param random.PRNGKey rng_key: Random number generator key to be used for the sampling.
         :param args: Arguments to be provided to the :meth:`numpyro.infer.mcmc.MCMCKernel.init` method.
             These are typically the arguments needed by the `model`.
-        :param extra_fields: Extra fields (aside from `z`, `diverging`) from :data:`numpyro.infer.mcmc.HMCState`
-            to collect during the MCMC run.
+        :param extra_fields: Extra fields (aside from :meth:`~numpyro.infer.MCMCKernel.default_fields`)
+            from the state object (e.g. :data:`numpyro.infer.mcmc.HMCState` for HMC) to collect during
+            the MCMC run.
         :type extra_fields: tuple or list
         :param bool collect_warmup: Whether to collect samples from the warmup phase. Defaults
             to `False`.
@@ -1204,37 +435,29 @@ class MCMC(object):
                 raise ValueError('`init_params` must have the same leading dimension'
                                  ' as `num_chains`.')
         assert isinstance(extra_fields, (tuple, list))
-        collect_fields = tuple(set(('z', 'diverging') + tuple(extra_fields)))
+        collect_fields = tuple(set((self._sample_field,) + tuple(self._default_fields) +
+                                   tuple(extra_fields)))
+        partial_map_fn = partial(self._single_chain_mcmc,
+                                 args=args,
+                                 kwargs=kwargs,
+                                 collect_fields=collect_fields)
+        map_args = (rng_key, init_state, init_params)
         if self.num_chains == 1:
-            states_flat, last_state = self._single_chain_mcmc(rng_key, init_state, init_params,
-                                                              args, kwargs, collect_fields)
+            states_flat, last_state = partial_map_fn(map_args)
             states = tree_map(lambda x: x[jnp.newaxis, ...], states_flat)
         else:
-            if self._jit_model_args:
-                partial_map_fn = partial(self._single_chain_jit_args,
-                                         collect_fields=collect_fields)
-            else:
-                partial_map_fn = partial(self._single_chain_nojit_args,
-                                         model_args=args,
-                                         model_kwargs=kwargs,
-                                         collect_fields=collect_fields)
             if chain_method == 'sequential':
                 if self.progress_bar:
-                    map_fn = partial(_laxmap, partial_map_fn)
+                    states, last_state = _laxmap(partial_map_fn, map_args)
                 else:
-                    map_fn = partial(lax.map, partial_map_fn)
+                    states, last_state = lax.map(partial_map_fn, map_args)
             elif chain_method == 'parallel':
-                map_fn = pmap(partial_map_fn)
-            elif chain_method == 'vectorized':
-                map_fn = partial_map_fn
+                states, last_state = pmap(partial_map_fn)(map_args)
+                # TODO: remove when https://github.com/google/jax/issues/3597 is resolved
+                states = device_put(states)
             else:
-                raise ValueError('Only supporting the following methods to draw chains:'
-                                 ' "sequential", "parallel", or "vectorized"')
-            if self._jit_model_args:
-                states, last_state = map_fn((rng_key, init_state, init_params, args, kwargs))
-            else:
-                states, last_state = map_fn((rng_key, init_state, init_params))
-            if chain_method == 'vectorized':
+                assert chain_method == 'vectorized'
+                states, last_state = partial_map_fn(map_args)
                 # swap num_samples x num_chains to num_chains x num_samples
                 states = tree_map(lambda x: jnp.swapaxes(x, 0, 1), states)
             states_flat = tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), states)
@@ -1254,7 +477,8 @@ class MCMC(object):
             but can be any :func:`jaxlib.pytree`, more generally (e.g. when defining a
             `potential_fn` for HMC that takes `list` args).
         """
-        return self._states['z'] if group_by_chain else self._states_flat['z']
+        return self._states[self._sample_field] if group_by_chain \
+            else self._states_flat[self._sample_field]
 
     def get_extra_fields(self, group_by_chain=False):
         """
@@ -1266,13 +490,14 @@ class MCMC(object):
             `extra_fields` keyword of :meth:`run`.
         """
         states = self._states if group_by_chain else self._states_flat
-        return {k: v for k, v in states.items() if k != 'z'}
+        return {k: v for k, v in states.items() if k != self._sample_field}
 
     def print_summary(self, prob=0.9, exclude_deterministic=True):
         # Exclude deterministic sites by default
-        sites = self._states['z']
+        sites = self._states[self._sample_field]
         if isinstance(sites, dict) and exclude_deterministic:
-            sites = {k: v for k, v in self._states['z'].items() if k in self._last_state.z}
+            sites = {k: v for k, v in self._states[self._sample_field].items()
+                     if k in self._last_state.z}
         print_summary(sites, prob=prob)
         extra_fields = self.get_extra_fields()
         if 'diverging' in extra_fields:

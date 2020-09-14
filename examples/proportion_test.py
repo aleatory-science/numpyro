@@ -18,12 +18,13 @@ import argparse
 import os
 from typing import Tuple
 
-import jax.numpy as jnp
-import numpyro
-import numpyro.distributions as dist
 from jax import random
+import jax.numpy as jnp
 from jax.scipy.special import expit
+
+import numpyro
 from numpyro.diagnostics import hpdi
+import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
 
 
@@ -124,7 +125,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    assert numpyro.__version__.startswith('0.2.4')
+    assert numpyro.__version__.startswith('0.3.0')
     parser = argparse.ArgumentParser(description='Testing whether  ')
     parser.add_argument('-n', '--num-samples', nargs='?', default=500, type=int)
     parser.add_argument('--num-warmup', nargs='?', default=1500, type=int)

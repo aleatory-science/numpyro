@@ -349,6 +349,26 @@ GammaPoisson
     :show-inheritance:
     :member-order: bysource
 
+Geometric
+---------
+.. autofunction:: numpyro.distributions.discrete.Geometric
+
+GeometricLogits
+---------------
+.. autoclass:: numpyro.distributions.discrete.GeometricLogits
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :member-order: bysource
+
+GeometricProbs
+--------------
+.. autoclass:: numpyro.distributions.discrete.GeometricProbs
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :member-order: bysource
+
 Multinomial
 -----------
 .. autofunction:: numpyro.distributions.discrete.Multinomial
@@ -406,6 +426,15 @@ VonMises
     :member-order: bysource
 
 
+TensorFlow Distributions
+========================
+
+Thin wrappers around TensorFlow Probability (TFP) distributions. For details on the TFP distribution interface,
+`its Distribution docs <https://www.tensorflow.org/probability/api_docs/python/tfp/substrates/jax/distributions/Distribution>`_.
+
+.. automodule:: numpyro.contrib.tfp.distributions
+
+
 Constraints
 ===========
 
@@ -448,6 +477,10 @@ integer_greater_than
 interval
 --------
 .. autofunction:: numpyro.distributions.constraints.interval
+
+less_than
+---------
+.. autofunction:: numpyro.distributions.constraints.less_than
 
 lower_cholesky
 --------------
@@ -565,17 +598,17 @@ InvCholeskyTransform
     :show-inheritance:
     :member-order: bysource
 
-LowerCholeskyTransform
-----------------------
-.. autoclass:: numpyro.distributions.transforms.LowerCholeskyTransform
+LowerCholeskyAffine
+-------------------
+.. autoclass:: numpyro.distributions.transforms.LowerCholeskyAffine
     :members:
     :undoc-members:
     :show-inheritance:
     :member-order: bysource
 
-MultivariateAffineTransform
----------------------------
-.. autoclass:: numpyro.distributions.transforms.MultivariateAffineTransform
+LowerCholeskyTransform
+----------------------
+.. autoclass:: numpyro.distributions.transforms.LowerCholeskyTransform
     :members:
     :undoc-members:
     :show-inheritance:

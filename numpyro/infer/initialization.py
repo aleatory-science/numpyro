@@ -26,7 +26,7 @@ def init_to_median(site=None, reinit_param=lambda site: False, num_samples=15):
         rng_key = site['kwargs'].get('rng_key')
         sample_shape = site['kwargs'].get('sample_shape')
         try:
-            samples = site['fn'].sample(rng_key, sample_shape=(num_samples,) + sample_shape)
+            samples = site['fn'](sample_shape=(num_samples,) + sample_shape, rng_key=rng_key)
             return jnp.median(samples, axis=0)
         except NotImplementedError:
             return init_to_uniform(site)
@@ -34,8 +34,7 @@ def init_to_median(site=None, reinit_param=lambda site: False, num_samples=15):
     if site['type'] == 'param' and reinit_param(site):
         return site['args'][0]
 
-
-def init_to_prior(site=None, reinit_param=lambda site: False):
+def init_to_sample(site=None):
     """
     Initialize to a prior sample. For priors with no `.sample` method implemented,
     we defer to the :func:`init_to_uniform` strategy.
@@ -74,8 +73,8 @@ def init_to_uniform(site=None, radius=2, reinit_param=lambda site: False):
             prototype_value = site['args'][0]
             transform = util.get_parameter_transform(site)
         unconstrained_shape = jnp.shape(transform.inv(prototype_value))
-        unconstrained_samples = dist.Uniform(-radius, radius).sample(
-            rng_key, sample_shape=sample_shape + unconstrained_shape)
+        unconstrained_samples = dist.Uniform(-radius, radius)(
+            rng_key=rng_key, sample_shape=sample_shape + unconstrained_shape)
         return transform(unconstrained_samples)
 
 

@@ -29,12 +29,12 @@ from collections import OrderedDict
 from contextlib import contextmanager
 import warnings
 
+from jax import lax, tree_util
 import jax.numpy as jnp
-from jax import lax
 
 from numpyro.distributions.constraints import is_dependent, real
 from numpyro.distributions.transforms import Transform
-from numpyro.distributions.util import lazy_property, sum_rightmost, validate_sample
+from numpyro.distributions.util import lazy_property, promote_shapes, sum_rightmost, validate_sample
 from numpyro.util import not_jax_tracer
 
 _VALIDATION_ENABLED = False
@@ -105,6 +105,21 @@ class Distribution(object):
     is_discrete = False
     reparametrized_params = []
     _validate_args = False
+
+    # register Distribution as a pytree
+    # ref: https://github.com/google/jax/issues/2916
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        tree_util.register_pytree_node(cls,
+                                       cls.tree_flatten,
+                                       cls.tree_unflatten)
+
+    def tree_flatten(self):
+        return tuple(getattr(self, param) for param in sorted(self.arg_constraints.keys())), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, params):
+        return cls(**dict(zip(sorted(cls.arg_constraints.keys()), params)))
 
     @staticmethod
     def set_default_validate_args(value):
@@ -247,7 +262,7 @@ class Distribution(object):
         :param reinterpreted_batch_ndims: Number of rightmost batch dims to
             interpret as event dims.
         :return: An instance of `Independent` distribution.
-        :rtype: Independent
+        :rtype: numpyro.distributions.distribution.Independent
         """
         if reinterpreted_batch_ndims is None:
             reinterpreted_batch_ndims = len(self.batch_shape)
@@ -288,7 +303,7 @@ class Distribution(object):
         :return: An expanded version of this distribution.
         :rtype: :class:`ExpandedDistribution`
         """
-        return self.expand(tuple(sample_shape) + self._batch_shape)
+        return self.expand(tuple(sample_shape) + self.batch_shape)
 
     def mask(self, mask):
         """
@@ -296,7 +311,8 @@ class Distribution(object):
         broadcastable to the distributions
         :attr:`Distribution.batch_shape` .
 
-        :param mask: A boolean or boolean valued array.
+        :param mask: A boolean or boolean valued array (`True` includes
+            a site, `False` excludes a site).
         :type mask: bool or jnp.ndarray
         :return: A masked copy of this distribution.
         :rtype: :class:`MaskedDistribution`
@@ -311,23 +327,19 @@ class ExpandedDistribution(Distribution):
 
     def __init__(self, base_dist, batch_shape=()):
         if isinstance(base_dist, ExpandedDistribution):
-            batch_shape = self._broadcast_shape(base_dist.batch_shape, batch_shape)
+            batch_shape, _, _ = self._broadcast_shape(base_dist.batch_shape, batch_shape)
             base_dist = base_dist.base_dist
         self.base_dist = base_dist
-        super().__init__(base_dist.batch_shape, base_dist.event_shape)
-        # adjust batch shape
-        self.expand(batch_shape)
 
-    def expand(self, batch_shape):
+        # adjust batch shape
         # Do basic validation. e.g. we should not "unexpand" distributions even if that is possible.
-        new_shape, _, _ = self._broadcast_shape(self.batch_shape, batch_shape)
+        new_shape, _, _ = self._broadcast_shape(base_dist.batch_shape, batch_shape)
         # Record interstitial and expanded dims/sizes w.r.t. the base distribution
-        new_shape, expanded_sizes, interstitial_sizes = self._broadcast_shape(self.base_dist.batch_shape,
+        new_shape, expanded_sizes, interstitial_sizes = self._broadcast_shape(base_dist.batch_shape,
                                                                               new_shape)
-        self._batch_shape = new_shape
         self._expanded_sizes = expanded_sizes
         self._interstitial_sizes = interstitial_sizes
-        return self
+        super().__init__(new_shape, base_dist.event_shape)
 
     @staticmethod
     def _broadcast_shape(existing_shape, new_shape):
@@ -368,7 +380,7 @@ class ExpandedDistribution(Distribution):
         interstitial_sizes = tuple(self._interstitial_sizes.values())
         expanded_sizes = tuple(self._expanded_sizes.values())
         batch_shape = expanded_sizes + interstitial_sizes
-        samples = self.base_dist.sample(key, sample_shape + batch_shape)
+        samples = self.base_dist(rng_key=key, sample_shape=sample_shape + batch_shape)
         interstitial_idx = len(sample_shape) + len(expanded_sizes)
         interstitial_sample_dims = tuple(range(interstitial_idx, interstitial_idx + len(interstitial_sizes)))
         for dim1, dim2 in zip(interstitial_dims, interstitial_sample_dims):
@@ -396,6 +408,21 @@ class ExpandedDistribution(Distribution):
     @property
     def variance(self):
         return jnp.broadcast_to(self.base_dist.variance, self.batch_shape + self.event_shape)
+
+    def tree_flatten(self):
+        prepend_ndim = len(self.batch_shape) - len(self.base_dist.batch_shape)
+        base_dist = tree_util.tree_map(
+            lambda x: promote_shapes(x, shape=(1,) * prepend_ndim + jnp.shape(x))[0],
+            self.base_dist)
+        base_flatten, base_aux = base_dist.tree_flatten()
+        return base_flatten, (type(self.base_dist), base_aux, self.batch_shape)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, params):
+        base_cls, base_aux, batch_shape = aux_data
+        base_dist = base_cls.tree_unflatten(base_aux, params)
+        prepend_shape = base_dist.batch_shape[:len(base_dist.batch_shape) - len(batch_shape)]
+        return cls(base_dist, batch_shape=prepend_shape + batch_shape)
 
 
 class ImproperUniform(Distribution):
@@ -467,6 +494,14 @@ class ImproperUniform(Distribution):
             mask = jnp.all(jnp.reshape(mask, jnp.shape(mask)[:batch_dim] + (-1,)), -1)
         return mask
 
+    def tree_flatten(self):
+        raise NotImplementedError(
+            "Cannot flattening ImproperPrior distribution for general supports. "
+            "Please raising a feature request for your specific `support`. "
+            "Alternatively, you can use '.mask(False)' pattern. "
+            "For example, to define an improper prior over positive domain, "
+            "we can use the distribution `dist.LogNormal(0, 1).mask(False)`.")
+
 
 class Independent(Distribution):
     """
@@ -530,11 +565,25 @@ class Independent(Distribution):
         return self.base_dist.variance
 
     def sample(self, key, sample_shape=()):
-        return self.base_dist.sample(key, sample_shape=sample_shape)
+        return self.base_dist(rng_key=key, sample_shape=sample_shape)
 
     def log_prob(self, value):
         log_prob = self.base_dist.log_prob(value)
         return sum_rightmost(log_prob, self.reinterpreted_batch_ndims)
+
+    def expand(self, batch_shape):
+        base_batch_shape = batch_shape + self.event_shape[:self.reinterpreted_batch_ndims]
+        return self.base_dist.expand(base_batch_shape).to_event(self.reinterpreted_batch_ndims)
+
+    def tree_flatten(self):
+        base_flatten, base_aux = self.base_dist.tree_flatten()
+        return base_flatten, (type(self.base_dist), base_aux, self.reinterpreted_batch_ndims)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, params):
+        base_cls, base_aux, reinterpreted_batch_ndims = aux_data
+        base_dist = base_cls.tree_unflatten(base_aux, params)
+        return cls(base_dist, reinterpreted_batch_ndims)
 
 
 class MaskedDistribution(Distribution):
@@ -553,7 +602,7 @@ class MaskedDistribution(Distribution):
         if isinstance(mask, bool):
             self._mask = mask
         else:
-            batch_shape = lax.broadcast_shapes(jnp.shape(mask), base_dist.batch_shape)
+            batch_shape = lax.broadcast_shapes(jnp.shape(mask), tuple(base_dist.batch_shape))
             if mask.shape != batch_shape:
                 mask = jnp.broadcast_to(mask, batch_shape)
             if base_dist.batch_shape != batch_shape:
@@ -575,16 +624,16 @@ class MaskedDistribution(Distribution):
         return self.base_dist.support
 
     def sample(self, key, sample_shape=()):
-        return self.base_dist.sample(key, sample_shape)
+        return self.base_dist(rng_key=key, sample_shape=sample_shape)
 
     def log_prob(self, value):
         if self._mask is False:
-            shape = lax.broadcast_shapes(self.base_dist.batch_shape,
+            shape = lax.broadcast_shapes(tuple(self.base_dist.batch_shape),
                                          jnp.shape(value)[:max(jnp.ndim(value) - len(self.event_shape), 0)])
             return jnp.zeros(shape)
         if self._mask is True:
             return self.base_dist.log_prob(value)
-        return self.base_dist.log_prob(value) * self._mask
+        return jnp.where(self._mask, self.base_dist.log_prob(value), 0.)
 
     def enumerate_support(self, expand=True):
         return self.base_dist.enumerate_support(expand=expand)
@@ -596,6 +645,24 @@ class MaskedDistribution(Distribution):
     @property
     def variance(self):
         return self.base_dist.variance
+
+    def tree_flatten(self):
+        base_flatten, base_aux = self.base_dist.tree_flatten()
+        if isinstance(self._mask, bool):
+            return base_flatten, (type(self.base_dist), base_aux, self._mask)
+        else:
+            return (base_flatten, self._mask), (type(self.base_dist), base_aux)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, params):
+        if len(aux_data) == 2:
+            base_flatten, mask = params
+            base_cls, base_aux = aux_data
+        else:
+            base_flatten = params
+            base_cls, base_aux, mask = aux_data
+        base_dist = base_cls.tree_unflatten(base_aux, base_flatten)
+        return cls(base_dist, mask)
 
 
 class TransformedDistribution(Distribution):
@@ -652,13 +719,13 @@ class TransformedDistribution(Distribution):
         return domain
 
     def sample(self, key, sample_shape=()):
-        x = self.base_dist.sample(key, sample_shape)
+        x = self.base_dist(rng_key=key, sample_shape=sample_shape)
         for transform in self.transforms:
             x = transform(x)
         return x
 
     def sample_with_intermediates(self, key, sample_shape=()):
-        x = self.base_dist.sample(key, sample_shape)
+        x = self.base_dist(rng_key=key, sample_shape=sample_shape)
         intermediates = []
         for transform in self.transforms:
             x_tmp = x
@@ -693,6 +760,13 @@ class TransformedDistribution(Distribution):
     @property
     def variance(self):
         raise NotImplementedError
+
+    def tree_flatten(self):
+        raise NotImplementedError(
+            "Flatenning TransformedDistribution is only supported for some specific cases."
+            " Consider using `TransformReparam` to convert this distribution to the base_dist,"
+            " which is supported in most situtations. In addition, please reach out to us with"
+            " your usage cases.")
 
 
 class Unit(Distribution):

@@ -1,8 +1,8 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import glob
+import os
 import shutil
 
 from sphinx_gallery.scrapers import figure_rst
@@ -98,7 +98,8 @@ language = None
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This patterns also effect to html_static_path and html_extra_path
-exclude_patterns = ['.ipynb_checkpoints', 'logistic_regression.ipynb']
+exclude_patterns = ['.ipynb_checkpoints', 'logistic_regression.ipynb',
+                    'examples/*ipynb', 'examples/*py']
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
@@ -177,8 +178,9 @@ class PNGScraper(object):
 
 sphinx_gallery_conf = {
     'examples_dirs': ['../../examples'],
-    'gallery_dirs': 'examples',
-    'filename_pattern': '.py',
+    'gallery_dirs': ['examples'],
+    # slow examples can be added to here to avoid execution
+    'filename_pattern': r'(?!hmm_enum)\b\w+.py\b',
     'ignore_pattern': '(minipyro|covtype|__init__)',
     'within_subsection_order': GalleryFileNameSortKey,
     'image_scrapers': ('matplotlib', PNGScraper()),

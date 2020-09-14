@@ -76,26 +76,29 @@ results for all the data points, but does so by using JAX's auto-vectorize trans
    -874.89813
 """
 
-from __future__ import absolute_import, division, print_function
-
 from collections import OrderedDict
 import warnings
 
 from jax import lax, random
 import jax.numpy as jnp
 
-from numpyro.primitives import Messenger
+import numpyro
+from numpyro.primitives import Messenger, apply_stack
 from numpyro.util import not_jax_tracer
 
 __all__ = [
     'block',
     'condition',
+    'lift',
+    'mask',
+    'reparam',
     'replay',
     'scale',
     'scope',
     'seed',
     'substitute',
     'trace',
+    'do'
 ]
 
 
@@ -134,7 +137,12 @@ class trace(Messenger):
         return self.trace
 
     def postprocess_message(self, msg):
-        assert not(msg['type'] == 'sample' and msg['name'] in self.trace), 'all sites must have unique names'
+        if 'name' not in msg:
+            # skip recording helper messages e.g. `control_flow`, `to_data`, `to_funsor`
+            # which has no name
+            return
+        assert not(msg['type'] == 'sample' and msg['name'] in self.trace), \
+            'all sites must have unique names but got `{}` duplicated'.format(msg['name'])
         self.trace[msg['name']] = msg.copy()
 
     def get_trace(self, *args, **kwargs):
@@ -220,8 +228,13 @@ class block(Messenger):
        >>> assert 'a' not in trace_block_a
        >>> assert 'b' in trace_block_a
     """
-    def __init__(self, fn=None, hide_fn=lambda msg: True):
-        self.hide_fn = hide_fn
+    def __init__(self, fn=None, hide_fn=None, hide=None):
+        if hide_fn is not None:
+            self.hide_fn = hide_fn
+        elif hide is not None:
+            self.hide_fn = lambda msg: msg.get('name') in hide
+        else:
+            self.hide_fn = lambda msg: True
         super(block, self).__init__(fn)
 
     def process_message(self, msg):
@@ -231,12 +244,12 @@ class block(Messenger):
 
 class condition(Messenger):
     """
-    Conditions unobserved sample sites to values from `param_map` or `condition_fn`.
+    Conditions unobserved sample sites to values from `data` or `condition_fn`.
     Similar to :class:`~numpyro.handlers.substitute` except that it only affects
     `sample` sites and changes the `is_observed` property to `True`.
 
     :param fn: Python callable with NumPyro primitives.
-    :param dict param_map: dictionary of `numpy.ndarray` values keyed by
+    :param dict data: dictionary of `numpy.ndarray` values keyed by
        site names.
     :param condition_fn: callable that takes in a site dict and returns
        a numpy array or `None` (in which case the handler has no side
@@ -259,42 +272,112 @@ class condition(Messenger):
        >>> assert exec_trace['a']['value'] == -1
        >>> assert exec_trace['a']['is_observed']
     """
-    def __init__(self, fn=None, param_map=None, condition_fn=None):
+    def __init__(self, fn=None, data=None, condition_fn=None):
         self.condition_fn = condition_fn
-        self.param_map = param_map
-        if sum((x is not None for x in (param_map, condition_fn))) != 1:
-            raise ValueError('Only one of `param_map` or `condition_fn` '
+        self.data = data
+        if sum((x is not None for x in (data, condition_fn))) != 1:
+            raise ValueError('Only one of `data` or `condition_fn` '
                              'should be provided.')
         super(condition, self).__init__(fn)
 
     def process_message(self, msg):
-        if msg['type'] != 'sample':
+        if (msg['type'] != 'sample') or msg.get('_control_flow_done', False):
+            if msg['type'] == 'control_flow':
+                if self.data is not None:
+                    msg['kwargs']['substitute_stack'].append(('condition', self.data))
+                if self.condition_fn is not None:
+                    msg['kwargs']['substitute_stack'].append(('condition', self.condition_fn))
             return
 
-        if self.param_map is not None:
-            value = self.param_map.get(msg['name'])
+        if self.data is not None:
+            value = self.data.get(msg['name'])
         else:
             value = self.condition_fn(msg)
 
         if value is not None:
             msg['value'] = value
-            if msg['is_observed']:
-                raise ValueError("Cannot condition an already observed site: {}.".format(msg['name']))
             msg['is_observed'] = True
+
+
+class lift(Messenger):
+    """
+    Given a stochastic function with ``param`` calls and a prior distribution,
+    create a stochastic function where all param calls are replaced by sampling from prior.
+    Prior should be a distribution or a dict of names to distributions.
+
+    Consider the following NumPyro program:
+
+        >>> import numpyro
+        >>> import numpyro.distributions as dist
+        >>> from numpyro.handlers import lift
+        >>>
+        >>> def model(x):
+        ...     s = numpyro.param("s", 0.5)
+        ...     z = numpyro.sample("z", dist.Normal(x, s))
+        ...     return z ** 2
+        >>> lifted_model = lift(model, prior={"s": dist.Exponential(0.3)})
+
+    ``lift`` makes ``param`` statements behave like ``sample`` statements
+    using the distributions in ``prior``.  In this example, site `s` will now behave
+    as if it was replaced with ``s = numpyro.sample("s", dist.Exponential(0.3))``.
+
+    :param fn: function whose parameters will be lifted to random values
+    :param prior: prior function in the form of a Distribution or a dict of Distributions
+    """
+
+    def __init__(self, fn=None, prior=None):
+        super().__init__(fn)
+        self.prior = prior
+        self._samples_cache = {}
+
+    def __enter__(self):
+        self._samples_cache = {}
+        return super().__enter__()
+
+    def __exit__(self, *args, **kwargs):
+        self._samples_cache = {}
+        return super().__exit__(*args, **kwargs)
+
+    def process_message(self, msg):
+        if msg["type"] != "param":
+            return
+
+        name = msg["name"]
+        fn = self.prior.get(name) if isinstance(self.prior, dict) else self.prior
+        if isinstance(fn, numpyro.distributions.Distribution):
+            msg["type"] = "sample"
+            msg["fn"] = fn
+            msg["args"] = ()
+            msg["kwargs"] = {"rng_key": msg["kwargs"].get("rng_key", None),
+                             "sample_shape": msg["kwargs"].get("sample_shape", ())}
+            msg["intermediates"] = []
+        else:
+            # otherwise leave as is
+            return
+
+        if name in self._samples_cache:
+            # Multiple pyro.param statements with the same
+            # name. Block the site and fix the value.
+            msg["value"] = self._samples_cache[name]["value"]
+            msg["is_observed"] = True
+            msg["stop"] = True
+        else:
+            self._samples_cache[name] = msg
+            msg["is_observed"] = False
 
 
 class mask(Messenger):
     """
     This messenger masks out some of the sample statements elementwise.
 
-    :param mask_array: a DeviceArray with `bool` dtype for masking elementwise masking
-        of sample sites.
+    :param mask: a boolean or a boolean-valued array for masking elementwise log
+        probability of sample sites (`True` includes a site, `False` excludes a site).
     """
-    def __init__(self, fn=None, mask_array=True):
-        if lax.dtype(mask_array) != 'bool':
+    def __init__(self, fn=None, mask=True):
+        if lax.dtype(mask) != 'bool':
             raise ValueError("`mask` should be a bool array.")
-        self.mask = mask_array
-        super(mask, self).__init__(fn)
+        self.mask = mask
+        super().__init__(fn)
 
     def process_message(self, msg):
         if msg['type'] != 'sample':
@@ -366,17 +449,17 @@ class scale(Messenger):
     This is typically used for data subsampling or for stratified sampling of data
     (e.g. in fraud detection where negatives vastly outnumber positives).
 
-    :param float scale_factor: a positive scaling factor
+    :param float scale: a positive scaling factor
     """
-    def __init__(self, fn=None, scale_factor=1.):
-        if not_jax_tracer(scale_factor):
-            if scale_factor <= 0:
-                raise ValueError("scale factor should be a positive number.")
-        self.scale = scale_factor
-        super(scale, self).__init__(fn)
+    def __init__(self, fn=None, scale=1.):
+        if not_jax_tracer(scale):
+            if scale <= 0:
+                raise ValueError("'scale' argument should be a positive number.")
+        self.scale = scale
+        super().__init__(fn)
 
     def process_message(self, msg):
-        if msg['type'] not in ('sample', 'plate'):
+        if msg['type'] not in ('param', 'sample', 'plate'):
             return
 
         msg["scale"] = self.scale if msg.get('scale') is None else self.scale * msg['scale']
@@ -454,10 +537,7 @@ class seed(Messenger):
        >>> y = handlers.seed(model, rng_seed=1)()
        >>> assert x == y
     """
-    def __init__(self, fn=None, rng_seed=None, rng=None):
-        if rng is not None:
-            warnings.warn('`rng` argument is deprecated and renamed to `rng_seed` instead.', DeprecationWarning)
-            rng_seed = rng
+    def __init__(self, fn=None, rng_seed=None):
         if isinstance(rng_seed, int) or (isinstance(rng_seed, jnp.ndarray) and not jnp.shape(rng_seed)):
             rng_seed = random.PRNGKey(rng_seed)
         if not (isinstance(rng_seed, jnp.ndarray) and rng_seed.dtype == jnp.uint32 and rng_seed.shape == (2,)):
@@ -466,7 +546,10 @@ class seed(Messenger):
         super(seed, self).__init__(fn)
 
     def process_message(self, msg):
-        if ((msg['type'] == 'sample' and not msg['is_observed']) or msg['type'] == 'rng_key' or msg['type'] == 'param')  and \
+        if (msg['type'] == 'sample' and not msg['is_observed'] and
+                msg['kwargs']['rng_key'] is None) or msg['type'] == 'control_flow':
+        if ((msg['type'] == 'sample' and not msg['is_observed']) or
+             msg['type'] == 'rng_key' or msg['type'] == 'param' or msg['type'] == 'control_flow')  and \
                 msg['kwargs'].get('rng_key') is None:
             self.rng_key, rng_key_sample = random.split(self.rng_key)
             msg['kwargs']['rng_key'] = rng_key_sample
@@ -474,18 +557,18 @@ class seed(Messenger):
 
 class substitute(Messenger):
     """
-    Given a callable `fn` and a dict `param_map` keyed by site names
+    Given a callable `fn` and a dict `data` keyed by site names
     (alternatively, a callable `substitute_fn`), return a callable
     which substitutes all primitive calls in `fn` with values from
-    `param_map` whose key matches the site name. If the site name
-    is not present in `param_map`, there is no side effect.
+    `data` whose key matches the site name. If the site name
+    is not present in `data`, there is no side effect.
 
     If a `substitute_fn` is provided, then the value at the site is
     replaced by the value returned from the call to `substitute_fn`
     for the given site.
 
     :param fn: Python callable with NumPyro primitives.
-    :param dict param_map: dictionary of `numpy.ndarray` values keyed by
+    :param dict data: dictionary of `numpy.ndarray` values keyed by
         site names.
     :param substitute_fn: callable that takes in a site dict and returns
         a numpy array or `None` (in which case the handler has no side
@@ -507,22 +590,98 @@ class substitute(Messenger):
        >>> exec_trace = trace(substitute(model, {'a': -1})).get_trace()
        >>> assert exec_trace['a']['value'] == -1
     """
-    def __init__(self, fn=None, param_map=None, substitute_fn=None):
+    def __init__(self, fn=None, data=None, substitute_fn=None):
         self.substitute_fn = substitute_fn
-        self.param_map = param_map
-        if sum((x is not None for x in (param_map, substitute_fn))) != 1:
-            raise ValueError('Only one of `param_map` or `substitute_fn` '
+        self.data = data
+        if sum((x is not None for x in (data, substitute_fn))) != 1:
+            raise ValueError('Only one of `data` or `substitute_fn` '
                              'should be provided.')
         super(substitute, self).__init__(fn)
 
     def process_message(self, msg):
-        if msg['type'] not in ('sample', 'param'):
+        if (msg['type'] not in ('sample', 'param')) or msg.get('_control_flow_done', False):
+            if msg['type'] == 'control_flow':
+                if self.data is not None:
+                    msg['kwargs']['substitute_stack'].append(('substitute', self.data))
+                if self.substitute_fn is not None:
+                    msg['kwargs']['substitute_stack'].append(('substitute', self.substitute_fn))
             return
 
-        if self.param_map is not None:
-            value = self.param_map.get(msg['name'])
+        if self.data is not None:
+            value = self.data.get(msg['name'])
         else:
             value = self.substitute_fn(msg)
 
         if value is not None:
             msg['value'] = value
+
+
+class do(Messenger):
+    """
+    Given a stochastic function with some sample statements
+    and a dictionary of values at names,
+    set the return values of those sites equal to the values
+    as if they were hard-coded to those values
+    and introduce fresh sample sites with the same names
+    whose values do not propagate.
+    Composes freely with :func:`~numpyro.handlers.condition`
+    to represent counterfactual distributions over potential outcomes.
+    See Single World Intervention Graphs [1] for additional details and theory.
+
+    This is equivalent to replacing `z = numpyro.sample("z", ...)` with `z = 1.`
+    and introducing a fresh sample site `numpyro.sample("z", ...)` whose value is not used elsewhere.
+
+    References
+
+    [1] `Single World Intervention Graphs: A Primer`,
+        Thomas Richardson, James Robins
+
+    :param fn: a stochastic function (callable containing Pyro primitive calls)
+    :param data: a ``dict`` mapping sample site names to interventions
+
+    **Example:**
+
+    .. doctest::
+
+      >>> import jax.numpy as jnp
+      >>> import numpyro
+      >>> from numpyro.handlers import do, trace, seed
+      >>> import numpyro.distributions as dist
+      >>> def model(x):
+      ...     s = numpyro.sample("s", dist.LogNormal())
+      ...     z = numpyro.sample("z", dist.Normal(x, s))
+      ...     return z ** 2
+      >>> intervened_model = handlers.do(model, data={"z": 1.})
+      >>> with trace() as exec_trace:
+      ...     z_square = seed(intervened_model, 0)(1)
+      >>> assert exec_trace['z']['value'] != 1.
+      >>> assert not exec_trace['z']['is_observed']
+      >>> assert not exec_trace['z'].get('stop', None)
+      >>> assert z_square == 1
+    """
+    def __init__(self, fn=None, data=None):
+        self.data = data
+        self._intervener_id = str(id(self))
+        super(do, self).__init__(fn)
+
+    def process_message(self, msg):
+        if msg['type'] != 'sample':
+            return
+        if msg.get('_intervener_id', None) != self._intervener_id and \
+                self.data.get(msg['name']) is not None:
+            if msg.get('_intervener_id', None) is not None:
+                warnings.warn(
+                    "Attempting to intervene on variable {} multiple times,"
+                    "this is almost certainly incorrect behavior".format(msg['name']),
+                    RuntimeWarning)
+            msg['_intervener_id'] = self._intervener_id
+
+            # split node, avoid reapplying self recursively to new node
+            new_msg = msg.copy()
+            apply_stack(new_msg)
+
+            intervention = self.data.get(msg['name'])
+            msg['name'] = msg['name'] + "__CF"  # mangle old name
+            msg['value'] = intervention
+            msg['is_observed'] = True
+            msg['stop'] = True

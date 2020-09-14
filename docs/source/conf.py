@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.abspath('../..'))
 os.environ['SPHINX_BUILD'] = '1'
 
 # HACK: This is to ensure that local functions are documented by sphinx.
-from numpyro.infer.mcmc import hmc  # noqa: E402
+from numpyro.infer.hmc import hmc  # noqa: E402
 hmc(None, None)
 
 # -- Project information -----------------------------------------------------
@@ -66,11 +66,9 @@ extensions = [
     'sphinx.ext.viewcode',
 ]
 
-# Disable documentation inheritance so as to avoid inheriting
-# docstrings in a different format, e.g. when the parent class
-# is a PyTorch class.
+# Enable documentation inheritance
 
-autodoc_inherit_docstrings = False
+autodoc_inherit_docstrings = True
 
 # autodoc_default_options = {
 #     'member-order': 'bysource',

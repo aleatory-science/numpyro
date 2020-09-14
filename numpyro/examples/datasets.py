@@ -5,6 +5,7 @@ from collections import namedtuple
 import csv
 import gzip
 import os
+import pickle
 import struct
 import pickle
 from urllib.parse import urlparse
@@ -60,8 +61,8 @@ LYNXHARE = dset('lynxhare', [
 ])
 
 
-JSBCHORALES = dset('jsbchorales', [
-    'http://www-etud.iro.umontreal.ca/~boulanni/JSB%20Chorales.pickle',
+JSB_CHORALES = dset('jsb_chorales', [
+    'https://d2hg8soec8ck9v.cloudfront.net/datasets/polyphonic/jsb_chorales.pickle',
 ])
 
 
@@ -173,26 +174,49 @@ def _load_lynxhare():
     }
 
 
-def _load_jsbchorales():
-    _download(JSBCHORALES)
+def _pad_sequence(sequences):
+    # like torch.nn.utils.rnn.pad_sequence with batch_first=True
+    max_length = max(x.shape[0] for x in sequences)
+    padded_sequences = []
+    for x in sequences:
+        pad = [(0, 0)] * np.ndim(x)
+        pad[0] = (0, max_length - x.shape[0])
+        padded_sequences.append(np.pad(x, pad))
+    return np.stack(padded_sequences)
 
-    file_path = os.path.join(DATA_DIR, 'JSB%20Chorales.pickle')
-    with open(file_path, 'rb') as file:
-        rawdset = pickle.load(file)
-        dset = {}
-        for key, vals in rawdset.items():
-            res = []
-            lengths = []
-            for chords in vals:
-                lengths.append(len(chords))
-                padded_chords = np.stack([np.pad(chord, (0, 4 - len(chord))) for chord in chords])
-                res.append(padded_chords)
-            padded_res = np.stack([np.pad(cs, [(0, max(lengths) - cs.shape[0]), (0,0)])
-                                   for cs in res])
-            padded_res_rev = np.stack([np.pad(np.flip(cs, axis=0), [(0, max(lengths) - cs.shape[0]), (0,0)]) 
-                                       for cs in res]) 
-            dset[key] = (padded_res, padded_res_rev, np.array(lengths))
-        return dset
+
+def _load_jsb_chorales():
+    _download(JSB_CHORALES)
+
+    file_path = os.path.join(DATA_DIR, 'jsb_chorales.pickle')
+    with open(file_path, 'rb') as f:
+        data = pickle.load(f)
+
+    # XXX: we might expose those in `load_dataset` keywords
+    min_note = 21
+    note_range = 88
+    processed_dataset = {}
+    for split, data_split in data.items():
+        processed_dataset[split] = {}
+        n_seqs = len(data_split)
+        processed_dataset[split]['sequence_lengths'] = np.zeros(n_seqs, dtype=np.long)
+        processed_dataset[split]['sequences'] = []
+        for seq in range(n_seqs):
+            seq_length = len(data_split[seq])
+            processed_dataset[split]['sequence_lengths'][seq] = seq_length
+            processed_sequence = np.zeros((seq_length, note_range))
+            for t in range(seq_length):
+                note_slice = np.array(list(data_split[seq][t])) - min_note
+                slice_length = len(note_slice)
+                if slice_length > 0:
+                    processed_sequence[t, note_slice] = np.ones(slice_length)
+            processed_dataset[split]['sequences'].append(processed_sequence)
+
+    for k, v in processed_dataset.items():
+        lengths = v["sequence_lengths"]
+        sequences = v["sequences"]
+        processed_dataset[k] = (lengths, _pad_sequence(sequences).astype("int32"))
+    return processed_dataset
 
 
 def _load(dset):
@@ -208,8 +232,8 @@ def _load(dset):
         return _load_ucbadmit()
     elif dset == LYNXHARE:
         return _load_lynxhare()
-    elif dset == JSBCHORALES:
-        return _load_jsbchorales()
+    elif dset == JSB_CHORALES:
+        return _load_jsb_chorales()
     raise ValueError('Dataset - {} not found.'.format(dset.name))
 
 

@@ -25,9 +25,11 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import numpy as np
+
 from jax import device_put, lax
 from jax.dtypes import canonicalize_dtype
-from jax.nn import softmax
+from jax.nn import softmax, softplus
 import jax.numpy as jnp
 import jax.random as random
 from jax.scipy.special import expit, gammaln, logsumexp, xlog1py, xlogy
@@ -44,9 +46,9 @@ from numpyro.distributions.util import (
     multinomial,
     promote_shapes,
     sum_rightmost,
-    validate_sample,
+    validate_sample
 )
-from numpyro.util import copy_docs_from, not_jax_tracer
+from numpyro.util import not_jax_tracer
 
 
 def _to_probs_bernoulli(logits):
@@ -67,7 +69,6 @@ def _to_logits_multinom(probs):
     return jnp.clip(jnp.log(probs), a_min=minval)
 
 
-@copy_docs_from(Distribution)
 class BernoulliProbs(Distribution):
     arg_constraints = {'probs': constraints.unit_interval}
     support = constraints.boolean
@@ -100,7 +101,6 @@ class BernoulliProbs(Distribution):
         return values
 
 
-@copy_docs_from(Distribution)
 class BernoulliLogits(Distribution):
     arg_constraints = {'logits': constraints.real}
     support = constraints.boolean
@@ -146,10 +146,9 @@ def Bernoulli(probs=None, logits=None, validate_args=None):
         raise ValueError('One of `probs` or `logits` must be specified.')
 
 
-@copy_docs_from(Distribution)
 class BinomialProbs(Distribution):
-    arg_constraints = {'total_count': constraints.nonnegative_integer,
-                       'probs': constraints.unit_interval}
+    arg_constraints = {'probs': constraints.unit_interval,
+                       'total_count': constraints.nonnegative_integer}
     has_enumerate_support = True
     is_discrete = True
 
@@ -194,10 +193,9 @@ class BinomialProbs(Distribution):
         return values
 
 
-@copy_docs_from(Distribution)
 class BinomialLogits(Distribution):
-    arg_constraints = {'total_count': constraints.nonnegative_integer,
-                       'logits': constraints.real}
+    arg_constraints = {'logits': constraints.real,
+                       'total_count': constraints.nonnegative_integer}
     has_enumerate_support = True
     is_discrete = True
 
@@ -257,7 +255,6 @@ def Binomial(total_count=1, probs=None, logits=None, validate_args=None):
         raise ValueError('One of `probs` or `logits` must be specified.')
 
 
-@copy_docs_from(Distribution)
 class CategoricalProbs(Distribution):
     arg_constraints = {'probs': constraints.simplex}
     has_enumerate_support = True
@@ -301,7 +298,6 @@ class CategoricalProbs(Distribution):
         return values
 
 
-@copy_docs_from(Distribution)
 class CategoricalLogits(Distribution):
     arg_constraints = {'logits': constraints.real_vector}
     has_enumerate_support = True
@@ -358,7 +354,6 @@ def Categorical(probs=None, logits=None, validate_args=None):
         raise ValueError('One of `probs` or `logits` must be specified.')
 
 
-@copy_docs_from(Distribution)
 class Delta(Distribution):
     arg_constraints = {'value': constraints.real, 'log_density': constraints.real}
     support = constraints.real
@@ -394,6 +389,13 @@ class Delta(Distribution):
     def variance(self):
         return jnp.zeros(self.batch_shape + self.event_shape)
 
+    def tree_flatten(self):
+        return (self.value, self.log_density), self.event_dim
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, params):
+        return cls(*params, event_dim=aux_data)
+
 
 class OrderedLogistic(CategoricalProbs):
     """
@@ -424,8 +426,8 @@ class OrderedLogistic(CategoricalProbs):
 
 @copy_docs_from(Distribution)
 class MultinomialProbs(Distribution):
-    arg_constraints = {'total_count': constraints.nonnegative_integer,
-                       'probs': constraints.simplex}
+    arg_constraints = {'probs': constraints.simplex,
+                       'total_count': constraints.nonnegative_integer}
     is_discrete = True
 
     def __init__(self, probs, total_count=1, validate_args=None):
@@ -461,10 +463,9 @@ class MultinomialProbs(Distribution):
         return constraints.multinomial(self.total_count)
 
 
-@copy_docs_from(Distribution)
 class MultinomialLogits(Distribution):
-    arg_constraints = {'total_count': constraints.nonnegative_integer,
-                       'logits': constraints.real_vector}
+    arg_constraints = {'logits': constraints.real_vector,
+                       'total_count': constraints.nonnegative_integer}
     is_discrete = True
 
     def __init__(self, logits, total_count=1, validate_args=None):
@@ -514,7 +515,6 @@ def Multinomial(total_count=1, probs=None, logits=None, validate_args=None):
         raise ValueError('One of `probs` or `logits` must be specified.')
 
 
-@copy_docs_from(Distribution)
 class Poisson(Distribution):
     arg_constraints = {'rate': constraints.positive}
     support = constraints.nonnegative_integer
@@ -525,7 +525,7 @@ class Poisson(Distribution):
         super(Poisson, self).__init__(jnp.shape(rate), validate_args=validate_args)
 
     def sample(self, key, sample_shape=()):
-        return random.poisson(key, device_put(self.rate), shape=sample_shape + self.batch_shape)
+        return random.poisson(key, self.rate, shape=sample_shape + self.batch_shape)
 
     @validate_sample
     def log_prob(self, value):
@@ -577,3 +577,77 @@ class ZeroInflatedPoisson(Distribution):
     @lazy_property
     def variance(self):
         return (1 - self.gate) * self.rate * (1 + self.rate * self.gate)
+
+
+class GeometricProbs(Distribution):
+    arg_constraints = {'probs': constraints.unit_interval}
+    support = constraints.nonnegative_integer
+    is_discrete = True
+
+    def __init__(self, probs, validate_args=None):
+        self.probs = probs
+        super(GeometricProbs, self).__init__(batch_shape=jnp.shape(self.probs),
+                                             validate_args=validate_args)
+
+    def sample(self, key, sample_shape=()):
+        probs = self.probs
+        dtype = get_dtype(probs)
+        shape = sample_shape + self.batch_shape
+        u = random.uniform(key, shape, dtype)
+        return jnp.floor(jnp.log1p(-u) / jnp.log1p(-probs))
+
+    @validate_sample
+    def log_prob(self, value):
+        probs = jnp.where((self.probs == 1) & (value == 0), 0, self.probs)
+        return value * jnp.log1p(-probs) + jnp.log(probs)
+
+    @property
+    def mean(self):
+        return 1. / self.probs - 1.
+
+    @property
+    def variance(self):
+        return (1. / self.probs - 1.) / self.probs
+
+
+class GeometricLogits(Distribution):
+    arg_constraints = {'logits': constraints.real}
+    support = constraints.nonnegative_integer
+    is_discrete = True
+
+    def __init__(self, logits, validate_args=None):
+        self.logits = logits
+        super(GeometricLogits, self).__init__(batch_shape=jnp.shape(self.logits),
+                                              validate_args=validate_args)
+
+    @lazy_property
+    def probs(self):
+        return _to_probs_bernoulli(self.logits)
+
+    def sample(self, key, sample_shape=()):
+        logits = self.logits
+        dtype = get_dtype(logits)
+        shape = sample_shape + self.batch_shape
+        u = random.uniform(key, shape, dtype)
+        return jnp.floor(jnp.log1p(-u) / -softplus(logits))
+
+    @validate_sample
+    def log_prob(self, value):
+        return (-value - 1) * softplus(self.logits) + self.logits
+
+    @property
+    def mean(self):
+        return 1. / self.probs - 1.
+
+    @property
+    def variance(self):
+        return (1. / self.probs - 1.) / self.probs
+
+
+def Geometric(probs=None, logits=None, validate_args=None):
+    if probs is not None:
+        return GeometricProbs(probs, validate_args=validate_args)
+    elif logits is not None:
+        return GeometricLogits(logits, validate_args=validate_args)
+    else:
+        raise ValueError('One of `probs` or `logits` must be specified.')

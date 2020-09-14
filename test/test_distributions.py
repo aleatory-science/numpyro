@@ -17,18 +17,13 @@ import jax.numpy as jnp
 import jax.random as random
 from jax.scipy.special import logsumexp
 
-from numpyro.nn import AutoregressiveNN
 import numpyro.distributions as dist
 from numpyro.distributions import constraints, transforms
 from numpyro.distributions.discrete import _to_probs_bernoulli, _to_probs_multinom
 from numpyro.distributions.flows import InverseAutoregressiveTransform
-from numpyro.distributions.transforms import MultivariateAffineTransform, PermuteTransform, PowerTransform, biject_to
-from numpyro.distributions.util import (
-    matrix_to_tril_vec,
-    multinomial,
-    signed_stick_breaking_tril,
-    vec_to_tril_matrix
-)
+from numpyro.distributions.transforms import LowerCholeskyAffine, PermuteTransform, PowerTransform, biject_to
+from numpyro.distributions.util import matrix_to_tril_vec, multinomial, signed_stick_breaking_tril, vec_to_tril_matrix
+from numpyro.nn import AutoregressiveNN
 
 
 def _identity(x): return x
@@ -79,6 +74,8 @@ _DIST_MAP = {
     dist.Dirichlet: lambda conc: osp.dirichlet(conc),
     dist.Exponential: lambda rate: osp.expon(scale=jnp.reciprocal(rate)),
     dist.Gamma: lambda conc, rate: osp.gamma(conc, scale=1. / rate),
+    dist.GeometricProbs: lambda probs: osp.geom(p=probs, loc=-1),
+    dist.GeometricLogits: lambda logits: osp.geom(p=_to_probs_bernoulli(logits), loc=-1),
     dist.Gumbel: lambda loc, scale: osp.gumbel_r(loc=loc, scale=scale),
     dist.HalfCauchy: lambda scale: osp.halfcauchy(scale=scale),
     dist.HalfNormal: lambda scale: osp.halfnorm(scale=scale),
@@ -91,7 +88,7 @@ _DIST_MAP = {
     dist.MultivariateNormal: _mvn_to_scipy,
     dist.LowRankMultivariateNormal: _lowrank_mvn_to_scipy,
     dist.Normal: lambda loc, scale: osp.norm(loc=loc, scale=scale),
-    dist.Pareto: lambda alpha, scale: osp.pareto(alpha, scale=scale),
+    dist.Pareto: lambda scale, alpha: osp.pareto(alpha, scale=scale),
     dist.Poisson: lambda rate: osp.poisson(rate),
     dist.StudentT: lambda df, loc, scale: osp.t(df=df, loc=loc, scale=scale),
     dist.Uniform: lambda a, b: osp.uniform(a, b - a),
@@ -158,9 +155,9 @@ CONTINUOUS = [
     T(dist.Normal, 0., 1.),
     T(dist.Normal, 1., jnp.array([1., 2.])),
     T(dist.Normal, jnp.array([0., 1.]), jnp.array([[1.], [2.]])),
-    T(dist.Pareto, 2., 1.),
-    T(dist.Pareto, jnp.array([0.3, 2.]), jnp.array([1., 0.5])),
-    T(dist.Pareto, jnp.array([1., 0.5]), jnp.array([[1.], [3.]])),
+    T(dist.Pareto, 1., 2.),
+    T(dist.Pareto, jnp.array([1., 0.5]), jnp.array([0.3, 2.])),
+    T(dist.Pareto, jnp.array([[1.], [3.]]), jnp.array([1., 0.5])),
     T(dist.StudentT, 1., 1., 0.5),
     T(dist.StudentT, 2., jnp.array([1., 2.]), 2.),
     T(dist.StudentT, jnp.array([3, 5]), jnp.array([[1.], [2.]]), 2.),
@@ -201,6 +198,9 @@ DISCRETE = [
     T(dist.CategoricalLogits, jnp.array([[-1, 2., 3.], [3., -4., -2.]])),
     T(dist.GammaPoisson, 2., 2.),
     T(dist.GammaPoisson, jnp.array([6., 2]), jnp.array([2., 8.])),
+    T(dist.GeometricProbs, 0.2),
+    T(dist.GeometricProbs, jnp.array([0.2, 0.7])),
+    T(dist.GeometricLogits, jnp.array([-1., 3.])),
     T(dist.MultinomialProbs, jnp.array([0.2, 0.7, 0.1]), 10),
     T(dist.MultinomialProbs, jnp.array([0.2, 0.7, 0.1]), jnp.array([5, 8])),
     T(dist.MultinomialLogits, jnp.array([-1., 3.]), jnp.array([[5], [8]])),
@@ -769,6 +769,8 @@ def test_categorical_log_prob_grad():
     (constraints.interval(-3, 5), 0, True),
     (constraints.interval(-3, 5), jnp.array([-5, -3, 0, 5, 7]),
      jnp.array([False, False, True, False, False])),
+    (constraints.less_than(1), -2, True),
+    (constraints.less_than(1), jnp.array([-1, 1, 5]), jnp.array([True, False, False])),
     (constraints.lower_cholesky, jnp.array([[1., 0.], [-2., 0.1]]), True),
     (constraints.lower_cholesky, jnp.array([[[1., 0.], [-2., -0.1]], [[1., 0.1], [2., 0.2]]]),
      jnp.array([False, False])),
@@ -800,6 +802,7 @@ def test_constraints(constraint, x, expected):
     constraints.corr_matrix,
     constraints.greater_than(2),
     constraints.interval(-3, 5),
+    constraints.less_than(1),
     constraints.lower_cholesky,
     constraints.ordered_vector,
     constraints.positive,
@@ -820,6 +823,8 @@ def test_biject_to(constraint, shape):
         assert transform.codomain.lower_bound == constraint.lower_bound
     elif isinstance(constraint, constraints._GreaterThan):
         assert transform.codomain.lower_bound == constraint.lower_bound
+    elif isinstance(constraint, constraints._LessThan):
+        assert transform.codomain.upper_bound == constraint.upper_bound
     if len(shape) < event_dim:
         return
     rng_key = random.PRNGKey(0)
@@ -889,7 +894,7 @@ def test_biject_to(constraint, shape):
 @pytest.mark.parametrize('transform, event_shape', [
     (PermuteTransform(jnp.array([3, 0, 4, 1, 2])), (5,)),
     (PowerTransform(2.), ()),
-    (MultivariateAffineTransform(jnp.array([1., 2.]), jnp.array([[0.6, 0.], [1.5, 0.4]])), (2,))
+    (LowerCholeskyAffine(jnp.array([1., 2.]), jnp.array([[0.6, 0.], [1.5, 0.4]])), (2,))
 ])
 @pytest.mark.parametrize('batch_shape', [(), (1,), (3,), (6,), (3, 1), (1, 3), (5, 3)])
 def test_bijective_transforms(transform, event_shape, batch_shape):
@@ -1125,3 +1130,36 @@ def test_mask(batch_shape, event_shape, mask_shape):
     samples = jax_dist.sample(random.PRNGKey(1))
     actual = jax_dist.mask(mask).log_prob(samples)
     assert_allclose(actual != 0, jnp.broadcast_to(mask, lax.broadcast_shapes(batch_shape, mask_shape)))
+
+
+@pytest.mark.parametrize('jax_dist, sp_dist, params', CONTINUOUS + DISCRETE + DIRECTIONAL)
+def test_dist_pytree(jax_dist, sp_dist, params):
+    def f(x):
+        return jax_dist(*params)
+
+    if jax_dist is _ImproperWrapper:
+        pytest.skip('Cannot flattening ImproperUniform')
+    jax.jit(f)(0)  # this test for flatten/unflatten
+    lax.map(f, np.ones(3))  # this test for compatibility w.r.t. scan
+
+
+@pytest.mark.parametrize('method, arg', [
+    ('to_event', 1),
+    ('mask', False),
+    ('expand', [5]),
+])
+def test_special_dist_pytree(method, arg):
+    def f(x):
+        d = dist.Normal(np.zeros(1), np.ones(1))
+        return getattr(d, method)(arg)
+
+    jax.jit(f)(0)
+    lax.map(f, np.ones(3))
+
+
+def test_expand_pytree():
+    def g(x):
+        return dist.Normal(x, 1).expand([10, 3])
+
+    assert lax.map(g, jnp.ones((5, 3))).batch_shape == (5, 10, 3)
+    assert jax.tree_map(lambda x: x[None], g(0)).batch_shape == (1, 10, 3)

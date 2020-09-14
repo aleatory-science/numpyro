@@ -12,15 +12,13 @@ import jax.numpy as jnp
 
 import numpyro
 from numpyro import handlers
-from numpyro.nn.auto_reg_nn import AutoregressiveNN
-from numpyro.nn.block_neural_arn import BlockNeuralAutoregressiveNN
 import numpyro.distributions as dist
 from numpyro.distributions import constraints
 from numpyro.distributions.flows import BlockNeuralAutoregressiveTransform, InverseAutoregressiveTransform
 from numpyro.distributions.transforms import (
     AffineTransform,
     ComposeTransform,
-    MultivariateAffineTransform,
+    LowerCholeskyAffine,
     PermuteTransform,
     UnpackTransform,
     biject_to
@@ -29,6 +27,8 @@ from numpyro.distributions.util import cholesky_of_inverse, sum_rightmost
 from numpyro.infer.elbo import ELBO
 from numpyro.infer.util import initialize_model, init_to_uniform, find_valid_initial_params
 from numpyro.infer.guide import ReinitGuide
+from numpyro.nn.auto_reg_nn import AutoregressiveNN
+from numpyro.nn.block_neural_arn import BlockNeuralAutoregressiveNN
 from numpyro.util import not_jax_tracer
 from contextlib import ExitStack
 
@@ -214,7 +214,7 @@ class AutoContinuous(AutoGuide):
             unpacked_samples = self._unpack_latent(latent)
             # add param sites in model
             unpacked_samples.update({k: v for k, v in params.items() if k in self.prototype_trace
-                                     and v['type'] == 'param'})
+                                     and self.prototype_trace[k]['type'] == 'param'})
             return self._postprocess_fn(unpacked_samples)
 
         sample_shape = jnp.shape(latent_sample)[:-1]
@@ -390,7 +390,7 @@ class AutoMultivariateNormal(AutoContinuous):
     def get_transform(self, params):
         loc = params['{}_loc'.format(self.prefix)]
         scale_tril = params['{}_scale_tril'.format(self.prefix)]
-        return MultivariateAffineTransform(loc, scale_tril)
+        return LowerCholeskyAffine(loc, scale_tril)
 
     def get_posterior(self, params):
         """
@@ -446,7 +446,7 @@ class AutoLowRankMultivariateNormal(AutoContinuous):
 
     def get_transform(self, params):
         posterior = self.get_posterior(params)
-        return MultivariateAffineTransform(posterior.loc, posterior.scale_tril)
+        return LowerCholeskyAffine(posterior.loc, posterior.scale_tril)
 
     def get_posterior(self, params):
         """
@@ -517,7 +517,7 @@ class AutoLaplaceApproximation(AutoContinuous):
                               " samples from AutoLaplaceApproxmiation will be constant (equal to"
                               " the MAP point).")
         scale_tril = jnp.where(jnp.isnan(scale_tril), 0., scale_tril)
-        return MultivariateAffineTransform(loc, scale_tril)
+        return LowerCholeskyAffine(loc, scale_tril)
 
     def get_posterior(self, params):
         """

@@ -25,6 +25,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
+        pip install https://github.com/pyro-ppl/funsor/archive/master.zip
         pip install jaxlib
         pip install jax
         pip install .[doc,test]
@@ -60,13 +61,14 @@ jobs:
         python -m pip install --upgrade pip
         # Keep track of pyro-api master branch
         pip install https://github.com/pyro-ppl/pyro-api/archive/master.zip
+        pip install https://github.com/pyro-ppl/funsor/archive/master.zip
         pip install jaxlib
         pip install jax
-        pip install .[test]
+        pip install .[dev,test]
         pip freeze
     - name: Test with pytest
       run: |
-        pytest -vs -k "not test_example" --deselect test/contrib/test_distributions_contrib.py --durations=100
+        pytest -vs -k "not test_example" --durations=100
     - name: Test x64
       run: |
         JAX_ENABLE_X64=1 pytest -vs test/test_mcmc.py -k x64
@@ -92,9 +94,10 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
+        pip install https://github.com/pyro-ppl/funsor/archive/master.zip
         pip install jaxlib
         pip install jax
-        pip install .[examples,test]
+        pip install .[dev,examples,test]
         pip freeze
     - name: Test with pytest
       run: |

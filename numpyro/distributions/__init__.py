@@ -30,6 +30,7 @@ from numpyro.distributions.continuous import (
     TruncatedPolyaGamma,
     Uniform
 )
+from numpyro.distributions.directional import VonMises
 from numpyro.distributions.discrete import (
     Bernoulli,
     BernoulliLogits,
@@ -41,6 +42,9 @@ from numpyro.distributions.discrete import (
     CategoricalLogits,
     CategoricalProbs,
     Delta,
+    Geometric,
+    GeometricLogits,
+    GeometricProbs,
     Multinomial,
     MultinomialLogits,
     MultinomialProbs,
@@ -48,7 +52,6 @@ from numpyro.distributions.discrete import (
     Poisson,
     ZeroInflatedPoisson
 )
-from numpyro.distributions.directional import VonMises
 from numpyro.distributions.distribution import (
     Distribution,
     ExpandedDistribution,
@@ -87,6 +90,9 @@ __all__ = [
     'Gamma',
     'GammaPoisson',
     'GaussianRandomWalk',
+    'Geometric',
+    'GeometricLogits',
+    'GeometricProbs',
     'Gumbel',
     'HalfCauchy',
     'HalfNormal',

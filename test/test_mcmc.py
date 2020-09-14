@@ -4,21 +4,22 @@
 import os
 
 import numpy as np
-from jax.test_util import check_close
 from numpy.testing import assert_allclose
 import pytest
 
-from jax import jit, pmap, random, vmap
+from jax import device_get, jit, pmap, random, vmap
 from jax.lib import xla_bridge
 import jax.numpy as jnp
 from jax.scipy.special import logit
+from jax.test_util import check_close
 
 import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import AffineTransform
 from numpyro.infer import HMC, MCMC, NUTS, SA
-from numpyro.infer.mcmc import hmc, _get_proposal_loc_and_scale, _numpy_delete
+from numpyro.infer.hmc import hmc
 from numpyro.infer.reparam import TransformReparam
+from numpyro.infer.sa import _get_proposal_loc_and_scale, _numpy_delete
 from numpyro.infer.util import initialize_model
 from numpyro.util import fori_collect
 
@@ -41,8 +42,8 @@ def test_unnormalized_normal_x64(kernel_cls, dense_mass):
     mcmc.run(random.PRNGKey(0), init_params=init_params)
     mcmc.print_summary()
     hmc_states = mcmc.get_samples()
-    assert_allclose(jnp.mean(hmc_states), true_mean, rtol=0.05)
-    assert_allclose(jnp.std(hmc_states), true_std, rtol=0.05)
+    assert_allclose(jnp.mean(hmc_states), true_mean, rtol=0.07)
+    assert_allclose(jnp.std(hmc_states), true_std, rtol=0.07)
 
     if 'JAX_ENABLE_X64' in os.environ:
         assert hmc_states.dtype == jnp.float64
@@ -379,6 +380,9 @@ def test_chain(use_init_params, chain_method):
     assert samples['coefs'].shape[:2] == (num_chains, num_samples)
     assert_allclose(jnp.mean(samples_flat['coefs'], 0), true_coefs, atol=0.21)
 
+    # test if reshape works
+    device_get(samples_flat['coefs'].reshape(-1))
+
 
 @pytest.mark.parametrize('kernel_cls', [HMC, NUTS])
 @pytest.mark.parametrize('chain_method', [
@@ -434,21 +438,24 @@ def test_chain_inside_jit(kernel_cls, chain_method):
 ])
 @pytest.mark.parametrize('compile_args', [
     False,
-    True
+    True,
 ])
 @pytest.mark.skipif('CI' in os.environ, reason="Compiling time the whole sampling process is slow.")
-def test_chain_smoke(chain_method, compile_args):
+def test_chain_jit_args_smoke(chain_method, compile_args):
     def model(data):
         concentration = jnp.array([1.0, 1.0, 1.0])
         p_latent = numpyro.sample('p_latent', dist.Dirichlet(concentration))
         numpyro.sample('obs', dist.Categorical(p_latent), obs=data)
         return p_latent
 
-    data = dist.Categorical(jnp.array([0.1, 0.6, 0.3])).sample(random.PRNGKey(1), (2000,))
+    data1 = dist.Categorical(jnp.array([0.1, 0.6, 0.3])).sample(random.PRNGKey(1), (50,))
+    data2 = dist.Categorical(jnp.array([0.2, 0.4, 0.4])).sample(random.PRNGKey(1), (50,))
     kernel = NUTS(model)
     mcmc = MCMC(kernel, 2, 5, num_chains=2, chain_method=chain_method, jit_model_args=compile_args)
-    mcmc.warmup(random.PRNGKey(0), data)
-    mcmc.run(random.PRNGKey(1), data)
+    mcmc.warmup(random.PRNGKey(0), data1)
+    mcmc.run(random.PRNGKey(1), data1)
+    # this should be fast if jit_model_args=True
+    mcmc.run(random.PRNGKey(2), data2)
 
 
 def test_extra_fields():
