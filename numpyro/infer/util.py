@@ -245,7 +245,8 @@ def find_valid_initial_params(rng_key, model,
                     params[k] = random.uniform(subkey, jnp.shape(v), minval=-radius, maxval=radius)
                     key, subkey = random.split(key)
 
-        potential_fn = partial(potential_energy, model, model_args, model_kwargs, enum=enum)
+        key, subkey = random.split(key)
+        potential_fn = partial(potential_energy, seed(model, key), model_args, model_kwargs, enum=enum)
         pe, z_grad = value_and_grad(potential_fn)(params)
         z_grad_flat = ravel_pytree(z_grad)[0]
         is_valid = jnp.isfinite(pe) & jnp.all(jnp.isfinite(z_grad_flat))
