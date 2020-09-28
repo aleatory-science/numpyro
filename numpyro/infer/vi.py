@@ -48,9 +48,8 @@ class VI(ABC):
             body_state, _ = info
             return self.update(body_state, *args, **kwargs)
 
-        rng_key, data_key, shuffle_key = jax.random.split(rng_key, 3)
         if batch_fun is not None:
-            batch_args, batch_kwargs, _, _ = batch_fun(0, shuffle_key)
+            batch_args, batch_kwargs, _, _ = batch_fun(0)
         else:
             batch_args = ()
             batch_kwargs = {}
@@ -84,8 +83,7 @@ class VI(ABC):
                     epoch = 0
                     is_last = False
                     if batch_fun is not None:
-                        data_key, shuffle_key = jax.random.split(data_key)
-                        batch_args, batch_kwargs, epoch, is_last = batch_fun(i, shuffle_key)
+                        batch_args, batch_kwargs, epoch, is_last = batch_fun(i)
                         if epoch_begin:
                             epoch_begin = False
                             for callback in callbacks:

@@ -105,10 +105,7 @@ class AutoGuide(ABC):
             if site['type'] != 'sample' or site['is_observed']:
                 continue
             for frame in site['cond_indep_stack']:
-                if frame.vectorized:
-                    self._prototype_frames[frame.name] = frame
-                else:
-                    raise NotImplementedError("AutoGuide does not support sequential numpyro.plate")
+                self._prototype_frames[frame.name] = frame
 
     def _create_plates(self, *args, **kwargs):
         if self.create_plates is None:
