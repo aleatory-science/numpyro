@@ -24,7 +24,8 @@ from numpyro.infer.util import _guess_max_plate_nesting
 from numpyro.optim import Adam
 
 
-def lda(doc_words, lengths, num_topics=20, num_words=100, num_max_elements=10):
+def lda(doc_words, lengths, num_topics=20, num_words=100, num_max_elements=10,
+        num_hidden=100):
     num_docs = doc_words.shape[0]
     topic_word_probs = numpyro.sample('topic_word_probs',
                                       dist.Dirichlet(jnp.ones((num_topics, num_words)) / num_words).to_event(1))
@@ -38,13 +39,14 @@ def lda(doc_words, lengths, num_topics=20, num_words=100, num_max_elements=10):
                 numpyro.sample('word', dist.Categorical(topic_word_probs[word_topic]), obs=doc_words)
 
 
-def lda_guide(doc_words, lengths, num_topics=20, num_words=100, num_max_elements=10):
+def lda_guide(doc_words, lengths, num_topics=20, num_words=100, num_max_elements=10,
+              num_hidden=100):
     num_docs = doc_words.shape[0]
     topic_word_pcs = numpyro.param('topic_word_pcs', jnp.ones((num_topics, num_words)),
                                    constraint=dist.constraints.positive)
     _topic_word_probs = numpyro.sample('topic_word_probs', dist.Dirichlet(topic_word_pcs).to_event(1))
     amortize_nn = numpyro.module('amortize_nn', stax.serial(
-        stax.Dense((num_topics + num_max_elements) // 2),
+        stax.Dense(num_hidden),
         stax.Relu,
         stax.Dense(num_topics),
         stax.Sigmoid
@@ -91,7 +93,7 @@ def main(_argv):
     batch_fn, num_max_elements = make_batcher(newsgroups_docs, batch_size=128)
     args, _, _, _ = batch_fn(0)
     rng_key = jax.random.PRNGKey(8938)
-    stein = Stein(lda, WrappedGuide(lda_guide, lambda s: s['name'] == 'word_topic'),
+    stein = Stein(lda, WrappedGuide(lda_guide),
                   Adam(0.1), ELBO(), RBFKernel(), num_particles=5,
                   num_topics=20, num_words=num_words,
                   num_max_elements=num_max_elements)

@@ -9,7 +9,7 @@ from jax.tree_util import tree_map
 
 from numpyro import handlers
 from numpyro.contrib.funsor import enum
-from numpyro.distributions import Distribution
+from numpyro.distributions import Distribution, Delta
 from numpyro.distributions.transforms import IdentityTransform
 from numpyro.infer import NUTS, MCMC, VI
 from numpyro.infer.guide import ReinitGuide
@@ -133,7 +133,7 @@ class Stein(VI):
         def scaled_loss(rng_key, classic_params, stein_params):
             params = {**classic_params, **stein_params}
             loss_val = self.loss.loss(rng_key, params, handlers.scale(self._inference_model, self.loss_temperature),
-                                      self.guide, *args, **kwargs, **self.static_kwargs)
+                                      self.guide, *args, **kwargs)
             return - loss_val
 
         kernel_particle_loss_fn = lambda ps: scaled_loss(rng_key, self.constrain_fn(classic_uparams),
@@ -264,7 +264,7 @@ class Stein(VI):
         for site in list(model_trace.values()) + list(guide_trace.values()):
             if site['name'] in model_trace:
                 if isinstance(site['fn'], Distribution) and site['fn'].is_discrete:
-                    if site['fn'].has_enumerate_support and self.enum:
+                    if (isinstance(site['fn'], Delta) or site['fn'].has_enumerate_support) and self.enum:
                         should_enum = True
                     else:
                         raise Exception("Cannot enumerate model with discrete variables without enumerate support")

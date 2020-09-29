@@ -7,7 +7,7 @@ import jax
 from jax import random, value_and_grad
 
 from numpyro.contrib.funsor import enum
-from numpyro.distributions import Distribution
+from numpyro.distributions import Distribution, Delta
 from numpyro.handlers import seed, trace, replay
 from numpyro.infer import VI
 from numpyro.infer.util import transform_fn, get_parameter_transform, _guess_max_plate_nesting
@@ -107,8 +107,8 @@ class SVI(VI):
                 transform = get_parameter_transform(site)
                 inv_transforms[site['name']] = transform
                 params[site['name']] = transform.inv(site['value'])
-            if isinstance(site['fn'], Distribution) and site['fn'].is_discrete and self.enum:
-                if site['fn'].has_enumerate_support:
+            if isinstance(site['fn'], Distribution) and site['fn'].is_discrete:
+                if (isinstance(site['fn'], Delta) or site['fn'].has_enumerate_support) and self.enum:
                     should_enum = True
                 else:
                     raise Exception("Cannot enumerate model with discrete variables without enumerate support")

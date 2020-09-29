@@ -1,11 +1,12 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
-
+import operator
 from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
 import os
 import random
 import re
+from functools import reduce
 
 import numpy as np
 import tqdm
@@ -240,7 +241,7 @@ pytree_metadata = namedtuple('pytree_metadata', ['flat', 'shape', 'event_size', 
 def _ravel_list(*leaves, batch_dims):
     leaves_metadata = tree_map(lambda l: pytree_metadata(
         jnp.reshape(l, (*jnp.shape(l)[:batch_dims], -1)), jnp.shape(l),
-        jnp.prod(jnp.shape(l)[batch_dims:], dtype='int32'), canonicalize_dtype(lax.dtype(l))), leaves)
+        reduce(operator.mul, jnp.shape(l)[batch_dims:], 1), canonicalize_dtype(lax.dtype(l))), leaves)
     leaves_idx = jnp.cumsum(jnp.array((0,) + tuple(d.event_size for d in leaves_metadata)))
 
     def unravel_list(arr):
