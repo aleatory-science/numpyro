@@ -86,10 +86,10 @@ def main(_argv):
                                        max_features=num_words,
                                        stop_words='english')
     newsgroups_docs = count_vectorizer.fit_transform(newsgroups)
-    batch_fn, num_max_elements = make_batcher(newsgroups_docs)
+    batch_fn, num_max_elements = make_batcher(newsgroups_docs, batch_size=128)
     args, _, _, _ = batch_fn(0)
     rng_key = jax.random.PRNGKey(8938)
-    svi = SVI(lda, lda_guide, Adam(1e-3), ELBO(), num_topics=20, num_words=num_words,
+    svi = SVI(lda, lda_guide, Adam(0.1), ELBO(), num_topics=20, num_words=num_words,
               num_max_elements=num_max_elements)
     svi.train(rng_key, 100, batch_fun=batch_fn, callbacks=[Progbar()])
 

@@ -6,9 +6,11 @@ from functools import namedtuple, partial
 import jax
 from jax import random, value_and_grad
 
+from numpyro.contrib.funsor import enum
+from numpyro.distributions import Distribution
 from numpyro.handlers import seed, trace, replay
 from numpyro.infer import VI
-from numpyro.infer.util import transform_fn, get_parameter_transform
+from numpyro.infer.util import transform_fn, get_parameter_transform, _guess_max_plate_nesting
 
 SVIState = namedtuple('SVIState', ['optim_state', 'rng_key'])
 """
@@ -68,12 +70,14 @@ class SVI(VI):
     :return: tuple of `(init_fn, update_fn, evaluate)`.
     """
 
-    def __init__(self, model, guide, optim, loss, **static_kwargs):
+    def __init__(self, model, guide, optim, loss, enum=True, **static_kwargs):
         super().__init__(model, guide, optim, loss, **static_kwargs, name='SVI')
+        self._inference_model = model
         self.model = model
         self.guide = guide
         self.loss = loss
         self.optim = optim
+        self.enum = enum
         self.static_kwargs = static_kwargs
         self.constrain_fn = None
 
@@ -96,12 +100,22 @@ class SVI(VI):
         model_trace = trace(replay(model_init, guide_trace)).get_trace(*args, **kwargs, **self.static_kwargs)
         params = {}
         inv_transforms = {}
+        should_enum = False
         # NB: params in model_trace will be overwritten by params in guide_trace
         for site in list(model_trace.values()) + list(guide_trace.values()):
             if site['type'] == 'param':
                 transform = get_parameter_transform(site)
                 inv_transforms[site['name']] = transform
                 params[site['name']] = transform.inv(site['value'])
+            if isinstance(site['fn'], Distribution) and site['fn'].is_discrete and self.enum:
+                if site['fn'].has_enumerate_support:
+                    should_enum = True
+                else:
+                    raise Exception("Cannot enumerate model with discrete variables without enumerate support")
+
+        if should_enum:
+            mpn = _guess_max_plate_nesting(model_trace)
+            self._inference_model = enum(self.model, - mpn - 1)
 
         self.constrain_fn = partial(transform_fn, inv_transforms)
         return SVIState(self.optim.init(params), rng_key)
@@ -130,7 +144,7 @@ class SVI(VI):
         rng_key, rng_key_step = random.split(svi_state.rng_key)
         params = self.optim.get_params(svi_state.optim_state)
         loss_val, grads = value_and_grad(
-            lambda x: self.loss.loss(rng_key_step, self.constrain_fn(x), self.model, self.guide,
+            lambda x: self.loss.loss(rng_key_step, self.constrain_fn(x), self._inference_model, self.guide,
                                      *args, **kwargs, **self.static_kwargs))(params)
         optim_state = self.optim.update(grads, svi_state.optim_state)
         return SVIState(optim_state, rng_key), loss_val
@@ -149,7 +163,7 @@ class SVI(VI):
         # we split to have the same seed as `update_fn` given an svi_state
         _, rng_key_eval = random.split(svi_state.rng_key)
         params = self.get_params(svi_state)
-        return self.loss.loss(rng_key_eval, params, self.model, self.guide,
+        return self.loss.loss(rng_key_eval, params, self._inference_model, self.guide,
                               *args, **kwargs, **self.static_kwargs)
 
     def predict(self, state, *args, num_samples=1, **kwargs):
