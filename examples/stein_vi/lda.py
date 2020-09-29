@@ -15,9 +15,11 @@ import numpy as np
 
 from numpyro.callbacks import Progbar
 from numpyro.contrib.funsor import enum
+from numpyro.guides import WrappedGuide
 from numpyro.handlers import trace, seed, block, mask
-from numpyro.infer import SVI, ELBO
+from numpyro.infer import SVI, ELBO, Stein
 from numpyro.infer.autoguide import AutoDelta
+from numpyro.infer.kernels import RBFKernel
 from numpyro.infer.util import _guess_max_plate_nesting
 from numpyro.optim import Adam
 
@@ -89,9 +91,11 @@ def main(_argv):
     batch_fn, num_max_elements = make_batcher(newsgroups_docs, batch_size=128)
     args, _, _, _ = batch_fn(0)
     rng_key = jax.random.PRNGKey(8938)
-    svi = SVI(lda, lda_guide, Adam(0.1), ELBO(), num_topics=20, num_words=num_words,
-              num_max_elements=num_max_elements)
-    svi.train(rng_key, 100, batch_fun=batch_fn, callbacks=[Progbar()])
+    stein = Stein(lda, WrappedGuide(lda_guide, lambda s: s['name'] == 'word_topic'),
+                  Adam(0.1), ELBO(), RBFKernel(), num_particles=5,
+                  num_topics=20, num_words=num_words,
+                  num_max_elements=num_max_elements)
+    stein.train(rng_key, 100, batch_fun=batch_fn, callbacks=[Progbar()])
 
 
 if __name__ == '__main__':

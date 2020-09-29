@@ -8,11 +8,13 @@ from jax import ops
 from jax.tree_util import tree_map
 
 from numpyro import handlers
+from numpyro.contrib.funsor import enum
+from numpyro.distributions import Distribution
 from numpyro.distributions.transforms import IdentityTransform
 from numpyro.infer import NUTS, MCMC, VI
 from numpyro.infer.guide import ReinitGuide
 from numpyro.infer.kernels import SteinKernel
-from numpyro.infer.util import transform_fn, get_parameter_transform
+from numpyro.infer.util import transform_fn, get_parameter_transform, _guess_max_plate_nesting
 from numpyro.util import ravel_pytree
 
 
@@ -25,7 +27,8 @@ class Stein(VI):
 
     def __init__(self, model, guide: ReinitGuide, optim, loss, kernel_fn: SteinKernel, num_particles: int = 10,
                  loss_temperature: float = 1.0, repulsion_temperature: float = 1.0,
-                 classic_guide_params_fn: Callable[[str], bool] = lambda name: False, sp_mcmc_crit='infl',
+                 classic_guide_params_fn: Callable[[str], bool] = lambda name: False,
+                 enum=True, sp_mcmc_crit='infl',
                  sp_mode='local', num_mcmc_particles: int = 0, num_mcmc_warmup: int = 100, num_mcmc_updates: int = 10,
                  sampler_fn=NUTS, sampler_kwargs=None, mcmc_kwargs=None, **static_kwargs):
         """
@@ -40,6 +43,7 @@ class Stein(VI):
             (More particles capture more of the posterior distribution)
         :param loss_temperature: scaling of loss factor
         :param repulsion_temperature: scaling of repulsive forces (Non-linear Stein)
+        :param enum: whether to apply automatic marginalization of discrete variables
         :param classic_guide_param_fn: predicate on names of parameters in guide which should be optimized classically without Stein (E.g., parameters for large normal networks or other transformation)
         :param sp_mcmc_crit: Stein Point MCMC update selection criterion, either 'infl' for most influential or 'rand' for random (EXPERIMENTAL)
         :param sp_mode: Stein Point MCMC mode for calculating Kernelized Stein Discrepancy. Either 'local' for only the updated MCMC particles or 'global' for all particles. (EXPERIMENTAL)
@@ -57,6 +61,7 @@ class Stein(VI):
         assert sp_mode == 'local' or sp_mode == 'global'
         assert 0 <= num_mcmc_particles <= num_particles
 
+        self._inference_model = model
         self.model = model
         self.guide = guide
         self.optim = optim
@@ -66,6 +71,7 @@ class Stein(VI):
         self.num_particles = num_particles
         self.loss_temperature = loss_temperature
         self.repulsion_temperature = repulsion_temperature
+        self.enum = enum
         self.classic_guide_params_fn = classic_guide_params_fn
         self.sp_mcmc_crit = sp_mcmc_crit
         self.sp_mode = sp_mode
@@ -126,8 +132,8 @@ class Stein(VI):
         # 2. Calculate loss and gradients for each parameter
         def scaled_loss(rng_key, classic_params, stein_params):
             params = {**classic_params, **stein_params}
-            loss_val = self.loss.loss(rng_key, params, handlers.scale(self.model, self.loss_temperature), self.guide,
-                                      *args, **kwargs, **self.static_kwargs)
+            loss_val = self.loss.loss(rng_key, params, handlers.scale(self._inference_model, self.loss_temperature),
+                                      self.guide, *args, **kwargs, **self.static_kwargs)
             return - loss_val
 
         kernel_particle_loss_fn = lambda ps: scaled_loss(rng_key, self.constrain_fn(classic_uparams),
@@ -189,7 +195,7 @@ class Stein(VI):
         warmup_key, mcmc_key = jax.random.split(rng_key)
         sampler = self.sampler_fn(
             potential_fn=lambda params: self.loss.loss(warmup_key, {**params, **self.constrain_fn(classic_uparams)},
-                                                       self.model, self.guide, *args, **kwargs))
+                                                       self._inference_model, self.guide, *args, **kwargs))
         mcmc = MCMC(sampler, self.num_mcmc_warmup, self.num_mcmc_updates, num_chains=self.num_mcmc_particles,
                     progress_bar=False, chain_method='vectorized',
                     **self.mcmc_kwargs)
@@ -253,8 +259,15 @@ class Stein(VI):
         inv_transforms = {}
         particle_transforms = {}
         guide_param_names = set()
+        should_enum = False
         # NB: params in model_trace will be overwritten by params in guide_trace
         for site in list(model_trace.values()) + list(guide_trace.values()):
+            if site['name'] in model_trace:
+                if isinstance(site['fn'], Distribution) and site['fn'].is_discrete:
+                    if site['fn'].has_enumerate_support and self.enum:
+                        should_enum = True
+                    else:
+                        raise Exception("Cannot enumerate model with discrete variables without enumerate support")
             if site['type'] == 'param':
                 transform = get_parameter_transform(site)
                 inv_transforms[site['name']] = transform
@@ -270,6 +283,9 @@ class Stein(VI):
                 if site['name'] in guide_trace:
                     guide_param_names.add(site['name'])
 
+        if should_enum:
+            mpn = _guess_max_plate_nesting(model_trace)
+            self._inference_model = enum(self.model, - mpn - 1)
         self.guide_param_names = guide_param_names
         self.constrain_fn = partial(transform_fn, inv_transforms)
         self.uconstrain_fn = partial(transform_fn, transforms)

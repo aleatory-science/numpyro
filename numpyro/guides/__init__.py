@@ -35,7 +35,6 @@ class WrappedGuide(ReinitGuide):
             guide = handlers.seed(handlers.block(self.fn, self.reinit_hide_fn), k2)
             guide_trace = handlers.trace(handlers.seed(self.fn, rng_key)).get_trace(*args, **kwargs)
             mapped_params, _ = handlers.block(find_valid_initial_params)(k1, guide, init_strategy=self.init_strategy,
-                                                                         param_as_improper=True,
                                                                          model_args=args,
                                                                          model_kwargs=kwargs)
             hidden_params = {name: site['value'] for name, site in guide_trace.items()
