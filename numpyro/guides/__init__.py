@@ -32,8 +32,6 @@ class WrappedGuide(ReinitGuide):
         guide_trace = handlers.trace(handlers.seed(self.fn, rng_keys[0])).get_trace(*args, **kwargs)
 
         def _find_valid_params(rng_key):
-            k1, k2 = jax.random.split(rng_key)
-            guide = handlers.seed(handlers.block(self.fn, self.reinit_hide_fn), k2)
             guide_trace = handlers.trace(handlers.seed(self.fn, rng_key)).get_trace(*args, **kwargs)
             params = {name: site['value'] for name, site in guide_trace.items()
                       if site['type'] == 'param' and self.reinit_hide_fn(site)}
@@ -42,7 +40,10 @@ class WrappedGuide(ReinitGuide):
                     params[site['name']] = self.init_strategy(site, reinit_param=lambda _: True)
             return params
 
-        init_params = jax.vmap(_find_valid_params)(rng_keys)
+        if rng_keys.ndim > 1:
+            init_params = jax.vmap(_find_valid_params)(rng_keys)
+        else:
+            init_params = _find_valid_params(rng_keys)
         params = {}
         for name, site in guide_trace.items():
             if site['type'] == 'param':

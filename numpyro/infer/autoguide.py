@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from pyro.infer.autoguide
+import functools
 from abc import ABC, abstractmethod
 import warnings
 
+import jax
 from jax import hessian, lax, random, tree_map
 from jax.experimental import stax
 from jax.flatten_util import ravel_pytree
@@ -681,17 +683,20 @@ class AutoDelta(AutoGuide, ReinitGuide):
         raise NotImplementedError
 
     def find_params(self, rng_keys, *args, **kwargs):
+        def _find_param(site, rng_key):
+            site = site.copy()
+            site['kwargs']['rng_key'] = rng_key
+            trans = biject_to(site['fn'].support)
+            return self.init_strategy(site, reinit_param=True)
         params = {site['name']: site['value'] for site in self.prototype_trace.values()
                   if site['type'] == 'sample' and not site['is_observed']}
-        (init_params, _, _), _ = handlers.block(find_valid_initial_params)(rng_keys, self.model,
-                                                                           init_strategy=self.init_strategy,
-                                                                           model_args=args,
-                                                                           model_kwargs=kwargs,
-                                                                           prototype_params=params)
         for name, site in self.prototype_trace.items():
             if site['type'] == 'sample' and not site['is_observed']:
                 param_name = "{}_{}".format(self.prefix, name)
-                param_val = biject_to(site['fn'].support)(init_params[name])
+                if rng_keys.ndim > 1:
+                    param_val = jax.vmap(functools.partial(_find_param, site))(rng_keys)
+                else:
+                    param_val = _find_param(site, rng_keys)
                 params[name] = (param_name, param_val, site['fn'].support)
         self._param_map = params
         self._init_params = {param: (val, constr) for param, val, constr in self._param_map.values()}
