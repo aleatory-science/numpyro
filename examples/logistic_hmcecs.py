@@ -31,7 +31,7 @@ import time
 from numpyro.diagnostics import summary
 from jax.tree_util import tree_flatten,tree_map
 
-numpyro.set_platform("cpu")
+numpyro.set_platform("gpu")
 
 def breast_cancer_data():
     dataset = load_breast_cancer()
@@ -100,9 +100,9 @@ def infer_hmcecs(rng_key, feats, obs, m=None,g=None,n_samples=None, warmup=None,
     file_hyperparams = open("PLOTS_{}/Hyperparameters_{}.txt".format(now.strftime("%Y_%m_%d_%Hh%Mmin%Ss%fms"),now.strftime("%Y_%m_%d_%Hh%Mmin%Ss%fms")), "a")
 
     if subsample_method=="perturb" and proxy== "taylor":
-        map_samples = 100
-        map_warmup = 50
-        factor_NUTS = 500
+        map_samples = 10
+        map_warmup = 5
+        factor_NUTS = 50
         if map_method == "NUTS":
             print("Running NUTS for map estimation {} + {} samples".format(map_samples,map_warmup))
             file_hyperparams.write('MAP samples : {} \n'.format(map_samples))
@@ -124,7 +124,7 @@ def infer_hmcecs(rng_key, feats, obs, m=None,g=None,n_samples=None, warmup=None,
         save_obj(z_ref,"{}/MAP_Dict_Samples_MAP_{}.pkl".format("PLOTS_{}".format(now.strftime("%Y_%m_%d_%Hh%Mmin%Ss%fms")), map_method))
         print("Running MCMC subsampling with Taylor proxy")
     elif subsample_method =="perturb" and proxy=="svi":
-        factor_SVI = 5000
+        factor_SVI = 50
         batch_size = int(factor_SVI//10)
         print("Running SVI for map estimation with svi proxy")
         file_hyperparams.write('SVI epochs : {} \n'.format(num_epochs))
@@ -224,10 +224,10 @@ def Folders(folder_name):
         shutil.rmtree(newpath)  # removes all the subdirectories!
         os.makedirs(newpath,0o777)
 def Plot_KL(map_method,ecs_algo,algo,proxy,estimator,n_samples,n_warmup,epochs):
-    factor_ECS= 50000#obs.shape[0]
+    factor_ECS= 500#obs.shape[0]
     m = [int(np_jax.sqrt(obs[:factor_ECS].shape[0])),2*int(np_jax.sqrt(obs[:factor_ECS].shape[0])),4*int(np_jax.sqrt(obs[:factor_ECS].shape[0])),8*int(np_jax.sqrt(obs[:factor_ECS].shape[0]))]
     g = 5
-    factor_NUTS = 500
+    factor_NUTS = 50
     colors = cm.rainbow(np.linspace(0, 1, len(m)))
     run_test = True
     if run_test:
@@ -293,14 +293,14 @@ def Tests(map_method,ecs_algo,algo,estimator,n_samples,n_warmup,epochs,proxy):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-num_samples', nargs='?', default=100,type=int)
-    parser.add_argument('-num_warmup', nargs='?', default=50, type=int)
+    parser.add_argument('-num_samples', nargs='?', default=10,type=int)
+    parser.add_argument('-num_warmup', nargs='?', default=5, type=int)
     parser.add_argument('-ecs_algo', nargs='?', default="NUTS", type=str)
     parser.add_argument('-ecs_proxy', nargs='?', default="svi", type=str)
     parser.add_argument('-algo', nargs='?', default="HMC", type=str)
-    parser.add_argument('-estimator', nargs='?', default="poisson", type=str)
+    parser.add_argument('-estimator', nargs='?', default=None, type=str)
     parser.add_argument('-map_init', nargs='?', default="NUTS", type=str)
-    parser.add_argument("-epochs",default=100,type=int)
+    parser.add_argument("-epochs",default=1,type=int)
     args = parser.parse_args()
 
 
@@ -319,7 +319,7 @@ if __name__ == '__main__':
     file_hyperparams.write('ECS proxy : {} \n'.format(args.ecs_proxy))
     file_hyperparams.write('MAP init : {} \n'.format(args.map_init))
 
-    higgs = True
+    higgs = False
     if higgs:
         feats,obs = higgs_data()
         file_hyperparams.write('Dataset : HIGGS \n')
@@ -329,8 +329,8 @@ if __name__ == '__main__':
         file_hyperparams.write('Dataset : BREAST CANCER DATA \n')
 
     file_hyperparams.close()
-    config.update('jax_disable_jit', True)
-
+    #config.update('jax_disable_jit', True)
+    #jax.config.disable_omnistaging()
     #Determine_best_sample_size(rng_key,feats[:100],obs[:100])
     #Tests(args.map_init,args.ecs_algo,args.algo,args.num_samples,args.num_warmup,args.epochs,args.ecs_proxy)
     Plot_KL(args.map_init,args.ecs_algo,args.algo,args.ecs_proxy,args.estimator,args.num_samples,args.num_warmup,args.epochs)
