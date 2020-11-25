@@ -4,8 +4,8 @@ from collections import namedtuple
 import math
 import os
 import warnings
-
-from jax import device_put, lax, partial, random, vmap,jacfwd, hessian,jit,ops
+import functools
+from jax import device_put, lax, partial, random, vmap,jacfwd, hessian,jit,ops,mask
 from jax.dtypes import canonicalize_dtype
 from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
@@ -112,7 +112,8 @@ def _update_block(rng_key, u, n, m, g):
         u_new = ops.index_add(u_new, i,
                               lax.cond(i // g == chosen_block, i, lambda _: idxs_new[i % (m // g)], i, lambda _: u[i]))
     return u_new
-
+#@partial(jit, static_argnums=(0,1,2))
+#@functools.partial(jit, static_argnums=(2))
 def _sample_u_poisson(rng_key, m, l):
     """ Initialize subsamples u
     ***References***
@@ -124,11 +125,27 @@ def _sample_u_poisson(rng_key, m, l):
     """
     pois_key, sub_key = random.split(rng_key)
     block_lengths = dist.discrete.Poisson(1).sample(pois_key, (l,)) #lambda block lengths
-    #u = random.randint(sub_key, (jnp.sum(block_lengths), ), 0, m)
-    u = random.randint(sub_key, (jnp.sum(block_lengths), m), 0, m)
+    #u = random.randint(sub_key, (jnp.sum(block_lengths), m), 0, m)
+    # @partial(mask, in_shapes=['(_,)'], out_shape='(_, _)')
+    # def u_rand(block_lenghts):
+    #     b = jnp.sum(block_lengths).astype(int)
+    #     #return jit(random.randint, static_argnums=(0,1, 2,3))(sub_key, (b,m), 0, m)
+    #     return random.randint(sub_key, (b,m), 0, m)
+    # u = u_rand([block_lengths],{})#dict(b=jnp.sum(block_lengths).astype(int),m=m,l=l))
+    # print(u.shape)
+    b = jnp.sum(block_lengths)
+    u_random = jit(random.randint, static_argnums=(0, 1, 2, 3))
+    u = u_random(sub_key, (b, m), 0, m)
+    # @partial(mask,in_shapes=['(tmp,)'],out_shape='(b,)')
+    # def u_rand(block_lengths):
+    #     return jnp.zeros(jnp.sum(block_lengths))
+    # u = u_rand([block_lengths],dict(tmp=l,b=jnp.sum(block_lengths)))
+    # print(u.shape)
+    #exit()
+
     return jnp.split(u, jnp.cumsum(block_lengths), axis=0)
 
-@partial(jit, static_argnums=(2, 3, 4))
+@partial(jit, static_argnums=(2, 3, 4,5))
 def _update_block_poisson(rng_key, u, m, l, g):
     """ Update block of u, where the length of the block of indexes to update is given by the Poisson distribution.
     ***References***
@@ -146,7 +163,8 @@ def _update_block_poisson(rng_key, u, m, l, g):
     block_key, sample_key = random.split(rng_key)
     num_updates = int(round(l / g, 0)) # choose lambda/g number of blocks to update
     chosen_blocks = random.randint(block_key, (num_updates,), 0, l)
-    new_blocks = _sample_u_poisson(sample_key, m, num_updates)
+    _sample_u_poisson_jit = jit(_sample_u_poisson, static_argnums=(2))
+    new_blocks = _sample_u_poisson_jit(sample_key, m, num_updates)
     for i, block in enumerate(chosen_blocks):
         u[block] = new_blocks[i]
     return u
@@ -518,7 +536,6 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, grad_potentia
                       ll_u=None,
                       sign = None,
                       u=None,n=None,m=None,l=None,
-                      z_and_sign=None,
                       sign_sum=None):
         """
         Given an existing :data:`~numpyro.infer.mcmc.HMCState`, run HMC with fixed (possibly adapted)
@@ -585,8 +602,8 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, grad_potentia
                         accept_prob, mean_accept_prob, diverging, adapt_state,rng_key)
 
         # Highlight: The accepted proposals samples are in vv_state.z /hmcstate.z, we store them together with the sign
-        if hmc_state.i < wa_steps:
-            sign_sum = 0
+
+        sign_sum = cond(hmc_state.i < wa_steps,sign_sum, lambda sign_sum:float(0),sign_sum,identity)
         z_and_sign = {**vv_state.z, 'sign': sign,"sign_sum":sign_sum}
         hmc_sub_state = HMCECSState(u=u, hmc_state=hmc_state,ll_u=ll_u,sign = sign,z_and_sign=z_and_sign)
         hmcstate = tuplemerge(hmc_sub_state._asdict(),hmcstate._asdict())
@@ -703,14 +720,14 @@ class HMCECS(MCMCKernel):
         self._ll_u = None
         self._u = None
         self._sign = None
-        self._sign_sum = 0
+        self._sign_sum = float(0)
         self._l = 100
         # Set on first call to init
         self._init_fn = None
         self._postprocess_fn = postprocess_fn
         self._sample_fn = None
         self._subsample_fn = None
-        self._sign = jnp.array([jnp.nan])
+        self._sign = float(0)
         self.proxy = proxy
         self.svi_fn = svi_fn
         self._proxy_fn = None
@@ -744,6 +761,7 @@ class HMCECS(MCMCKernel):
                 self._proxy_fn,self._proxy_u_fn = taylor_proxy(self.z_ref, self._model, self._ll_ref, self._jac_all, self._hess_all)
             if self.estimator =="poisson":
                 self._l = 50 # lambda subsamples
+                #_sample_u_poisson_jit = jit(_sample_u_poisson, static_argnums=(1, 2))
                 self._u = _sample_u_poisson(rng_key, self.m, self._l)
 
                 self._potential_fn = lambda model,model_args,model_kwargs,z,l, proxy_fn,proxy_u_fn : lambda z:signed_estimator(model = model,model_args=model_args,
@@ -1023,7 +1041,6 @@ class HMCECS(MCMCKernel):
         if self._postprocess_fn is None:
             return identity
         else:
-            print("here4")
             return self._postprocess_fn(*args, **kwargs)
 
     def sample(self, state, model_args, model_kwargs):
@@ -1041,6 +1058,7 @@ class HMCECS(MCMCKernel):
             rng_key_subsample, rng_key_transition, rng_key_likelihood, rng_key = random.split(
                 state.rng_key, 4)
             if self.estimator == "poisson":
+                #_sample_u_poisson_jit = jit(_sample_u_poisson,static_argnums=(0,1,2))
                 u_new = _sample_u_poisson(rng_key, self.m, self._l)
                 neg_ll, sign = signed_estimator(model = self._model,
                                                 model_args=[model_args_sub(u_i, model_args) for u_i in u_new],
@@ -1057,7 +1075,7 @@ class HMCECS(MCMCKernel):
             else:
                 u_new = _update_block(rng_key_subsample, state.u, self._n, self.m, self.g)
                 # estimate likelihood of subsample with single block updated
-                llu_new = self._potential_fn(model=self._model,
+                llu_new = potential_est(model=self._model,
                                         model_args=model_args_sub(u_new,model_args),
                                         model_kwargs=model_kwargs,
                                         z=state.z,
@@ -1067,6 +1085,7 @@ class HMCECS(MCMCKernel):
                                         proxy_u_fn=self._proxy_u_fn)
             # accept new subsample with probability min(1,L^{hat}_{u_new}(z) - L^{hat}_{u}(z))
             # NOTE: latent variables (z aka theta) same, subsample indices (u) different by one block.
+            print(llu_new)
             accept_prob = jnp.clip(jnp.exp(-llu_new + state.ll_u), a_max=1.)
             transition = random.bernoulli(rng_key_transition, accept_prob)  #TODO: Why Bernoulli instead of Uniform?
             u, ll_u = cond(transition,
@@ -1097,8 +1116,7 @@ class HMCECS(MCMCKernel):
                                    m= self.m,
                                    l=self._l,
                                    sign = self._sign,
-                                   sign_sum = state.z_and_sign["sign_sum"],
-                                   z_and_sign=z_and_sign)
+                                   sign_sum = state.z_and_sign["sign_sum"])
 
         else:
             return self._sample_fn(state, model_args, model_kwargs)
