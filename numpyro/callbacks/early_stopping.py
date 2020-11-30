@@ -36,13 +36,13 @@ class EarlyStopping(Callback):
     def update_and_early_stop(self, loss):
         if self.smoothing == 'dexp':
             self.prev_loss = self.curr_loss
-            self.curr_loss = (self.data_smoothing_factor * loss +
-                              (1 - self.data_smoothing_factor) * (self.curr_loss + self.trend))
             if self.trend is None:
                 self.trend = loss - self.curr_loss
             else:
                 self.trend = (self.trend_smoothing_factor * (self.curr_loss - self.prev_loss) +
                               (1 - self.trend_smoothing_factor) * self.trend)
+            self.curr_loss = (self.data_smoothing_factor * loss +
+                              (1 - self.data_smoothing_factor) * (self.curr_loss + self.trend))
         elif self.smoothing == 'exp':
             self.curr_loss = (self.data_smoothing_factor * loss +
                               (1 - self.data_smoothing_factor) * self.curr_loss)
