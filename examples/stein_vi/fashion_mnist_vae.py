@@ -1,3 +1,4 @@
+import itertools
 import sys
 from math import sqrt
 from random import randint
@@ -12,8 +13,10 @@ from numpyro import distributions as dist
 from numpyro.callbacks import Progbar, History, EarlyStopping, TerminateOnNaN
 from numpyro.callbacks.reduce_lr import ReduceLROnPlateau
 from numpyro.examples.datasets import load_dataset, FASHION_MNIST
-from numpyro.infer import SVI, ELBO, Predictive, RenyiELBO
-from numpyro.infer.kernels import RBFKernel
+from numpyro.infer import SVI, ELBO, Predictive, RenyiELBO, Stein
+from numpyro.infer.guide import WrappedGuide
+from numpyro.infer.kernels import RBFKernel, IMQKernel, LinearKernel, RandomFeatureKernel, PrecondMatrixKernel, \
+    HessianPrecondMatrix
 from numpyro.optim import Adam
 
 import matplotlib.pyplot as plt
@@ -115,31 +118,35 @@ def _plot_history(history):
 
 
 def main(_argv):
-    numpyro.set_platform('gpu')
+    # numpyro.set_platform('gpu')
     numpyro.enable_validation()
-    num_steps = 25_000
+    num_steps = 100
     rng_key = jax.random.PRNGKey(randint(0, 10000))
     rng_key, pred_rng_key = jax.random.split(rng_key)
-    losses = [ELBO(), RenyiELBO()]
-    test_configurations = [
-        ("svi_elbo", ELBO(), RBFKernel(), 1),
-        ("svi_renyi_elbo", RenyiELBO(), RBFKernel(), 1),
-        ("stein_3_elbo", ELBO(), RBFKernel(), 3),
-        ("stein_3_renyi_elbo", RenyiELBO(), RBFKernel(), 3),
-        ("stein_5_elbo", ELBO(), RBFKernel(), 5),
-        ("stein_5_renyi_elbo", RenyiELBO(), RBFKernel(), 5),
-        ("stein_7_elbo", ELBO(), RBFKernel(), 7),
-        ("stein_7_renyi_elbo", RenyiELBO(), RBFKernel(), 7),
-    ]
-    svi = SVI(model, guide, Adam(1e-3), ELBO())
-    batch_fun, test_batch = _make_batcher()
+    configurations = _make_configurations()
 
-    _plot_mnist_like(test_batch)
-    history = History()
-    svi_state, loss = svi.train(rng_key, num_steps, batch_fun=batch_fun,
-                                callbacks=[Progbar(), ReduceLROnPlateau(), TerminateOnNaN(), history])
-    _plot_predictive(pred_rng_key, svi.get_params(svi_state))
-    _plot_history(history)
+    for config_name, kernel, loss, num_particles in configurations:
+        stein = Stein(model, WrappedGuide(guide), Adam(1e-3), loss,
+                      kernel, num_particles)
+        batch_fun, test_batch = _make_batcher()
+
+        _plot_mnist_like(test_batch)
+        history = History()
+        svi_state, loss = stein.train(rng_key, num_steps, batch_fun=batch_fun,
+                                      callbacks=[Progbar(), ReduceLROnPlateau(), TerminateOnNaN(), history])
+        _plot_predictive(pred_rng_key, stein.get_params(svi_state))
+        _plot_history(history)
+
+
+def _make_configurations():
+    kernels = [RBFKernel(), IMQKernel(), LinearKernel(), RandomFeatureKernel(),
+               PrecondMatrixKernel(HessianPrecondMatrix(), RBFKernel(mode='matrix'))]
+    losses = [ELBO(), RenyiELBO()]
+    num_particles = [1, 3, 5, 7]
+    configurations = []
+    for kernel, loss, num_particles in itertools.product(kernels, losses, num_particles):
+        configurations.append((f"{type(kernel).__name__}_{type(loss).__name__}_{num_particles}", kernel, loss, num_particles))
+    return configurations
 
 
 if __name__ == '__main__':
