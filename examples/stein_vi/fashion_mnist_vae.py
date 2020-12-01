@@ -92,7 +92,7 @@ def _plot_mnist_like(images):
 
 
 def _make_batcher():
-    init, get_batch = load_dataset(FASHION_MNIST, 32)
+    init, get_batch = load_dataset(FASHION_MNIST, 16)
     num_batches, idxs = init()
     test_batch, _ = get_batch(idxs=idxs)
 
@@ -118,8 +118,6 @@ def _plot_history(history):
 
 
 def main(_argv):
-    # numpyro.set_platform('gpu')
-    numpyro.enable_validation()
     num_steps = 100
     rng_key = jax.random.PRNGKey(randint(0, 10000))
     rng_key, pred_rng_key = jax.random.split(rng_key)
@@ -145,7 +143,8 @@ def _make_configurations():
     num_particles = [1, 3, 5, 7]
     configurations = []
     for kernel, loss, num_particles in itertools.product(kernels, losses, num_particles):
-        configurations.append((f"{type(kernel).__name__}_{type(loss).__name__}_{num_particles}", kernel, loss, num_particles))
+        configurations.append((f"{type(kernel).__name__}_{type(loss).__name__}_{num_particles}",
+                               kernel, loss, num_particles))
     return configurations
 
 

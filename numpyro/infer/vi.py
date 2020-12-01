@@ -43,7 +43,7 @@ class VI(ABC):
 
     def train(self, rng_key, num_steps, *args, callbacks: List[ncallback.Callback] = None, batch_fun=None,
               validation_rate=5, validation_fun=None, restore=False, restore_path=None,
-              jit_compile=True, **kwargs):
+              jit_compile=True, jit_platform='cpu', **kwargs):
         def bodyfn(_i, info, *args, **kwargs):
             body_state, _ = info
             return self.update(body_state, *args, **kwargs)
@@ -74,7 +74,7 @@ class VI(ABC):
                     'model_kwargs': kwargs
                 }
                 if jit_compile:
-                    bodyfn = jax.jit(bodyfn)
+                    bodyfn = jax.jit(bodyfn, device=jit_platform)
                 for callback in callbacks:
                     callback.vi = self
                     callback.on_train_begin(train_info)
