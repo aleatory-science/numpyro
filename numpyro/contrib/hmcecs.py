@@ -399,7 +399,6 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, grad_potentia
         hmc_state = HMCState(0, vv_state.z, vv_state.z_grad, vv_state.potential_energy, energy,
                              0, 0., 0., False, wa_state,rng_key_hmc)
 
-        #TODO: sign_sum = sign_sum + sign ? only for warm up?
         z_and_sign  = {**vv_state.z, 'sign': sign, "sign_sum":sign_sum }
 
         hmc_sub_state = HMCECSState(u=u, hmc_state=hmc_state,ll_u=ll_u,sign=sign,z_and_sign=z_and_sign)
@@ -860,7 +859,10 @@ class HMCECS(MCMCKernel):
 
     @property
     def default_fields(self):
-        return ('z', 'diverging','sign',"z_and_sign")
+        if self.estimator =="poisson":
+            return ('z', 'diverging','sign',"z_and_sign")
+        else:
+            return 'z'
 
     def get_diagnostics_str(self, state):
         return '{} steps of size {:.2e}. acc. prob={:.2f}'.format(state.num_steps,
@@ -1068,7 +1070,7 @@ class HMCECS(MCMCKernel):
                                                 proxy_fn = self._proxy_fn,
                                                 proxy_u_fn = self._proxy_u_fn)
                 self._sign=jnp.array(sign)
-                state.z_and_sign["sign_sum"] += self._sign
+                state.z_and_sign["sign_sum"] += self._sign #TODO: Probably is a multiplication
                 # Correct the negativeloglikelihood by substracting the density of the prior to calculate the potential
                 llu_new = jnp.min(jnp.array([0, -neg_ll + state.ll_u]))
 
@@ -1085,7 +1087,6 @@ class HMCECS(MCMCKernel):
                                         proxy_u_fn=self._proxy_u_fn)
             # accept new subsample with probability min(1,L^{hat}_{u_new}(z) - L^{hat}_{u}(z))
             # NOTE: latent variables (z aka theta) same, subsample indices (u) different by one block.
-            print(llu_new)
             accept_prob = jnp.clip(jnp.exp(-llu_new + state.ll_u), a_max=1.)
             transition = random.bernoulli(rng_key_transition, accept_prob)  #TODO: Why Bernoulli instead of Uniform?
             u, ll_u = cond(transition,
