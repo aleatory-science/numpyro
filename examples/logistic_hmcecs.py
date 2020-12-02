@@ -105,19 +105,19 @@ def infer_hmcecs(rng_key, feats, obs, m=None,g=None,n_samples=None, warmup=None,
         factor_NUTS = 50
         if map_method == "NUTS":
             print("Running NUTS for map estimation {} + {} samples".format(map_samples,map_warmup))
-            file_hyperparams.write('MAP samples : {} \n'.format(map_samples))
-            file_hyperparams.write('MAP warmup : {} \n'.format(map_warmup))
+            file_hyperparams.write('NUTS MAP samples : {} \n'.format(map_samples))
+            file_hyperparams.write('NUTS MAP warmup : {} \n'.format(map_warmup))
             samples,r_hat_average = infer_nuts(map_key, feats[:factor_NUTS], obs[:factor_NUTS],samples=map_samples,warmup=map_warmup)
             z_ref = {key: value.mean(0) for key, value in samples.items()}
         if map_method == "HMC":
             print("Running HMC for map estimation")
-            file_hyperparams.write('MAP samples : {} \n'.format(map_samples))
-            file_hyperparams.write('MAP warmup : {} \n'.format(map_warmup))
+            file_hyperparams.write('HMC MAP samples : {} \n'.format(map_samples))
+            file_hyperparams.write('HMC MAP warmup : {} \n'.format(map_warmup))
             samples, r_hat_average = infer_hmc(map_key, feats[:factor_NUTS], obs[:factor_NUTS], samples=map_samples, warmup=map_warmup)
             z_ref = {key: value.mean(0) for key, value in samples.items()}
         if map_method == "SVI":
             print("Running SVI for map estimation")
-            file_hyperparams.write('SVI epochs : {} \n'.format(num_epochs))
+            file_hyperparams.write('SVI MAP epochs : {} \n'.format(num_epochs))
             z_ref = svi_map(model, map_key, feats=feats, obs=obs,num_epochs=num_epochs,batch_size = m)
             z_ref = {k[5:]: v for k, v in z_ref.items()} #highlight: [5:] is to skip the "auto" part
         svi = None
@@ -151,9 +151,9 @@ def infer_hmcecs(rng_key, feats, obs, m=None,g=None,n_samples=None, warmup=None,
     post_fn=None
     if estimator == "poisson":
         extra_fields = ("sign",)
-        post_fn = kernel._postprocess_fn
+        #post_fn = kernel._postprocess_fn #not necessary
 
-    mcmc = MCMC(kernel,num_warmup=warmup,num_samples=n_samples,num_chains=1,postprocess_fn=post_fn)
+    mcmc = MCMC(kernel,num_warmup=warmup,num_samples=n_samples,num_chains=1) #,postprocess_fn=post_fn)
     mcmc.run(rng_key,feats,obs,extra_fields=extra_fields)
     extra_fields = mcmc.get_extra_fields()
     stop = time.time()
@@ -232,14 +232,14 @@ def Plot_KL(map_method,ecs_algo,algo,proxy,estimator,n_samples,n_warmup,epochs):
     run_test = True
     if run_test:
         print("Running standard NUTS")
-        #est_posterior_NUTS = infer_hmcecs(rng_key, feats=feats[:factor_NUTS], obs=obs[:factor_NUTS],n_samples=n_samples, warmup=n_warmup, m="all", g=g, algo=algo) #TODO: Fix
+        est_posterior_NUTS = infer_hmcecs(rng_key, feats=feats[:factor_NUTS], obs=obs[:factor_NUTS],n_samples=n_samples, warmup=n_warmup, m="all", g=g, algo=algo) #TODO: Fix
 
-        if algo == "NUTS":
-
-            est_posterior_NUTS,_ = samples,r_hat_average = infer_nuts(rng_key, feats[:factor_NUTS], obs[:factor_NUTS],samples=n_samples,warmup=n_warmup)
-        else:
-            est_posterior_NUTS, _ = samples, r_hat_average = infer_hmc(rng_key, feats[:factor_NUTS], obs[:factor_NUTS],
-                                                                        samples=n_samples, warmup=n_warmup)
+        # if algo == "NUTS":
+        #
+        #     est_posterior_NUTS,_ = samples,r_hat_average = infer_nuts(rng_key, feats[:factor_NUTS], obs[:factor_NUTS],samples=n_samples,warmup=n_warmup)
+        # else:
+        #     est_posterior_NUTS, _ = samples, r_hat_average = infer_hmc(rng_key, feats[:factor_NUTS], obs[:factor_NUTS],
+        #                                                                 samples=n_samples, warmup=n_warmup)
     for m_val, color in zip(m,colors):
         est_posterior_ECS = infer_hmcecs(rng_key, feats=feats[:factor_ECS], obs=obs[:factor_ECS],
                                          n_samples=n_samples,
@@ -296,9 +296,9 @@ if __name__ == '__main__':
     parser.add_argument('-num_samples', nargs='?', default=10,type=int)
     parser.add_argument('-num_warmup', nargs='?', default=5, type=int)
     parser.add_argument('-ecs_algo', nargs='?', default="NUTS", type=str)
-    parser.add_argument('-ecs_proxy', nargs='?', default="svi", type=str)
+    parser.add_argument('-ecs_proxy', nargs='?', default="taylor", type=str)
     parser.add_argument('-algo', nargs='?', default="HMC", type=str)
-    parser.add_argument('-estimator', nargs='?', default=None, type=str)
+    parser.add_argument('-estimator', nargs='?', default="poisson", type=str)
     parser.add_argument('-map_init', nargs='?', default="NUTS", type=str)
     parser.add_argument("-epochs",default=1,type=int)
     args = parser.parse_args()
@@ -329,7 +329,7 @@ if __name__ == '__main__':
         file_hyperparams.write('Dataset : BREAST CANCER DATA \n')
 
     file_hyperparams.close()
-    #config.update('jax_disable_jit', True)
+    config.update('jax_disable_jit', True)
     #jax.config.disable_omnistaging()
     #Determine_best_sample_size(rng_key,feats[:100],obs[:100])
     #Tests(args.map_init,args.ecs_algo,args.algo,args.num_samples,args.num_warmup,args.epochs,args.ecs_proxy)
