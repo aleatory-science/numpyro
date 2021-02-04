@@ -138,7 +138,10 @@ class ECS(MCMCKernel):
                        ll.items()}  # TODO: fix broadcast
             prior, _ = log_density(block(model, hide_fn=lambda site: site['type'] == 'sample' and site['is_observed']),
                                    model_args, model_kwargs, posterior_samples)
-            variational, _ = log_density(guide, model_args, model_kwargs, posterior_samples)
+
+            dummy_subsample = {k: jnp.array([], dtype=jnp.int32) for k in ['N']}
+            with block(), substitute(data=dummy_subsample):
+                variational, _ = log_density(guide, model_args, model_kwargs, posterior_samples)
             evidence = {name: variational / num_samples - prior / num_samples - ll.mean(1).sum() for name, ll in
                         ll.items()}  # TODO: must depend on structure!
 

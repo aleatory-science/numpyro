@@ -100,7 +100,7 @@ def benchmark_hmc(args, features, labels):
         kernel = HMCECS(inner_kernel, num_blocks=100, proxy=taylor_proxy(neutra_ref_params))
     elif args.algo == "HMCVECS":
         subsample_size = 1000
-        guide = AutoNormal(model)
+        guide = AutoDiagonalNormal(model)
         svi = SVI(model, guide, numpyro.optim.Adam(0.01), Trace_ELBO())
         params, losses = svi.run(random.PRNGKey(2), 2000, features, labels)
         plt.plot(losses)

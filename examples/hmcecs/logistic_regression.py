@@ -10,6 +10,7 @@ from jax import random, device_get
 from pandas_plink import read_plink1_bin
 from sklearn.datasets import load_breast_cancer
 
+from numpyro.contrib.ecs import ECS
 import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions import constraints
@@ -31,7 +32,7 @@ def summary(dataset, name, mcmc, sample_time, svi_time=0., plates={}):
     pickle.dump(mcmc.get_samples(True), open(f'{dataset}/{name}_posterior_samples.pkl', 'wb'))
     step_field = 'num_steps' if name in ['hmc', 'nuts'] else 'hmc_state.num_steps'
     num_step = np.sum(mcmc.get_extra_fields()[step_field])
-    accpt_prob = np.mean(mcmc.get_extra_fields()['accept_prob']) if 'ecs' in name else 1.
+    accpt_prob = np.mean(mcmc.get_extra_fields()['hmc_state.accept_prob']) if 'ecs' in name else 1.
 
     with open(f'{dataset}/{name}_chain_stats.txt', 'w') as f:
         print('sample_time', 'svi_time', 'n_eff_mean', 'gibbs_accpt_prob', 'tot_num_steps', 'time_per_step',
@@ -81,20 +82,19 @@ def guide(feature, obs, subsample_size):
 
 def hmcecs_model(dataset, data, obs, subsample_size, proxy_name='vari'):
     model_args, model_kwargs = (data, obs, subsample_size), {}
-
     svi_key, proxy_key, estimator_key, mcmc_key = random.split(random.PRNGKey(0), 4)
-    optimizer = numpyro.optim.Adam(step_size=5e-5)
+    # optimizer = numpyro.optim.Adam(step_size=5e-5)
     guide = autoguide.AutoNormal(model)
-    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
+    # svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
     start = time()
-    params, losses = svi.run(svi_key, 10000, *model_args)
+    # params, losses = svi.run(svi_key, 1000, *model_args)
     svi_time = time() - start
-    plt.plot(losses)
-    plt.show()
-
-    pickle.dump(params, open(f'{dataset}/svi_params.pkl', 'wb'))
-    params = params
-
+    # plt.plot(losses)
+    # plt.show()
+    #
+    # pickle.dump(params, open(f'{dataset}/svi_params.pkl', 'wb'))
+    params = pickle.load(open('gpu_higgs_2021_02_03_193824/svi_params.pkl', 'rb'))
+    #
     proxy_key, ref_key = random.split(proxy_key)
     # FIXME should we substitute params to here; or even better using the optimized mean for taylor proxy?
     ref_params = _predictive(ref_key, guide, {}, (1,), return_sites='', parallel=True,
@@ -107,12 +107,16 @@ def hmcecs_model(dataset, data, obs, subsample_size, proxy_name='vari'):
 
     else:
         proxy_fn = variational_proxy(guide, params)
-
+    # kernel = ECS(NUTS(model),
+    #                  proxy='variational',
+    #                  model_struct={'obs': ['theta']},
+    #                  ref=params,
+    #                  guide=guide)
     # Compute HMCECS
     kernel = HMCECS(NUTS(model), proxy=proxy_fn)
     mcmc = MCMC(kernel, 1000, 1000)
     start = time()
-    mcmc.run(random.PRNGKey(3), data, obs, subsample_size, extra_fields=("accept_prob",
+    mcmc.run(random.PRNGKey(3), data, obs, subsample_size, extra_fields=("hmc_state.accept_prob",
                                                                          "hmc_state.num_steps"))
     mcmc.print_summary()
     summary(dataset, f'ecs_{proxy_name}', mcmc, time() - start, svi_time=svi_time, plates={'N': ''})
@@ -127,7 +131,7 @@ def plain_log_reg_model(features, obs):
 
 def nuts(dataset, data, obs, ref_param):
     kernel = NUTS(plain_log_reg_model, trajectory_length=1.2, init_strategy=init_to_value(values=ref_param))
-    mcmc = MCMC(kernel, 1000, 1000)
+    mcmc = MCMC(kernel, 100, 200)
     mcmc._compile(random.PRNGKey(0), data, obs, extra_fields=("num_steps",))
     start = time()
     mcmc.run(random.PRNGKey(0), data, obs, extra_fields=('num_steps',))
@@ -136,7 +140,7 @@ def nuts(dataset, data, obs, ref_param):
 
 def hmc(dataset, data, obs, ref_param):
     kernel = HMC(plain_log_reg_model, trajectory_length=1.2, init_strategy=init_to_value(values=ref_param))
-    mcmc = MCMC(kernel, 1000, 1000)
+    mcmc = MCMC(kernel, 100, 2000)
     mcmc._compile(random.PRNGKey(0), data, obs, extra_fields=("num_steps",))
     start = time()
     mcmc.run(random.PRNGKey(0), data, obs, extra_fields=('num_steps',))
@@ -145,9 +149,8 @@ def hmc(dataset, data, obs, ref_param):
 
 if __name__ == '__main__':
 
-    load_data = {'breast': breast_cancer_data}  # ,'higgs': higgs_data}  , 'copsac': copsac_data}
+    load_data = {'higgs': higgs_data}  # {'breast': breast_cancer_data}  # , 'copsac': copsac_data}
     subsample_sizes = {'higgs': 1300, 'breast': 75, }  # 'copsac': 1000,
-    data, obs = breast_cancer_data()
 
     # FIXME: can we change platform in a JAX program?
     for dataset in load_data.keys():
@@ -155,8 +158,8 @@ if __name__ == '__main__':
         if not os.path.exists(dir):
             os.mkdir(dir)
         data, obs = load_data[dataset]()
-        ref_param = hmcecs_model(dir, data, obs, subsample_sizes[dataset], proxy_name='variational')
-        # ref_param = hmcecs_model(dir, data, obs, subsample_sizes[dataset], proxy_name='taylor')
-        # hmc(dir, data, obs, ref_param)
-        # nuts(dir, data, obs, ref_param)
+        # ref_param = hmcecs_model(dir, data, obs, subsample_sizes[dataset], proxy_name='variational')
+        ref_param = hmcecs_model(dir, data, obs, subsample_sizes[dataset], proxy_name='taylor')
+        hmc(dir, data, obs, ref_param)
+        nuts(dir, data, obs, ref_param)
         exit()

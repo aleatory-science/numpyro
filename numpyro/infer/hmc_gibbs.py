@@ -789,7 +789,7 @@ def variational_proxy(guide, guide_params, num_particles=10):
                 warnings.filterwarnings('ignore', category=UserWarning)
                 dummy_subsample = {k: jnp.array([], dtype=jnp.int32) for k in subsample_plate_sizes}
                 with block(), substitute(data=dummy_subsample):
-                    prior_prob, _ = log_density(model, model_args, model_kwargs, params)
+                    prior_prob, _ = log_density(model, model_kwargs, params)
             return prior_prob
 
         return_sites = [k for k, site in prototype_trace.items()
@@ -797,17 +797,20 @@ def variational_proxy(guide, guide_params, num_particles=10):
         posterior_samples = _predictive(pos_key, guide_with_params, {}, (num_particles,), return_sites=return_sites,
                                         parallel=True, model_args=model_args, model_kwargs=model_kwargs)
         log_likelihood_ref = vmap(log_likelihood)(posterior_samples)
+        log_likelihood_ref = {k: v / num_particles for k, v in log_likelihood_ref.items()}
 
-        log_prior_prob = vmap(log_prior)(posterior_samples)
-        log_posterior_prob = vmap(log_posterior)(posterior_samples)
+        log_prior_prob = vmap(log_prior)(posterior_samples) / num_particles
+        log_posterior_prob = vmap(log_posterior)(posterior_samples) / num_particles
 
         # softmax(E_{z~Q}[l(x_i,z)])
-        weights = {name: jax.nn.softmax(log_like.sum(0) / num_particles) for name, log_like in
+        weights = {name: jax.nn.softmax(jnp.exp(log_posterior_prob / num_particles) @ log_like / num_particles) for
+                   name, log_like in
                    log_likelihood_ref.items()}
 
         # ELBO = exp(log(Q(z)) @ (log(L(z)) + log(pi(z)) - log(Q(z)))
         elbo = {
-            name: jnp.exp(log_posterior_prob/num_particles) @ (log_prior_prob + log_like.sum(1) - log_posterior_prob) / num_particles
+            name: jnp.exp(log_posterior_prob / num_particles) @ (
+                    log_prior_prob + log_like.sum(1) - log_posterior_prob) / num_particles
             for name, log_like in log_likelihood_ref.items()}
 
         def gibbs_init(rng_key, gibbs_sites):
