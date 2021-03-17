@@ -1,14 +1,19 @@
 import os
+import argparse
 import pickle
 import tarfile
 from time import time
 from urllib.request import urlretrieve
-
+import sklearn.metrics as metrics
+from sklearn.preprocessing import label_binarize
+import matplotlib.pyplot as plt
 import numpy as np
 from flax import nn
 from flax.nn.activation import selu, softmax
 from jax import random, device_get
-
+from jax import random, vmap
+from matplotlib.pyplot import cm
+from numpyro import handlers
 import numpyro
 import numpyro.distributions as dist
 from numpyro.contrib.module import random_flax_module
@@ -25,7 +30,7 @@ def cifar10(path=None):
 
     Returns:
         Tuple of (train_images, train_labels, test_images, test_labels), each
-            a matrix. Rows are examples. Columns of images are pixel values,
+            a matrix. Rows are examples. 50000 train examples and 10000 test examples. Columns of images are pixel values,
             with the order (red -> blue -> green). Columns of labels are a
             onehot encoding of the correct class.
     """
@@ -125,28 +130,82 @@ class Network(nn.Module):
         return l4
 
 
-def model(data, obs):
+def model(data, obs=None):
     module = Network.partial(out_channels=10)
     net = random_flax_module('conv_nn', module, dist.Normal(0, 1.), input_shape=data.shape)
 
     if obs is not None:
         obs = obs[..., None]
+    #with numpyro.plate("data_plate",data.shape[0]):
     numpyro.sample('obs', dist.Categorical(logits=net(data)), obs=obs)
 
 
-def hmc(dataset, data, obs):
+def nuts(dataset, data, obs):
     kernel = NUTS(model, init_strategy=init_to_median)
-    mcmc = MCMC(kernel, 100, 100)
+    mcmc = MCMC(kernel, args.num_warmup, args.num_samples)
     mcmc._compile(random.PRNGKey(0), data, obs, extra_fields=("num_steps",))
     start = time()
     mcmc.run(random.PRNGKey(0), data, obs, extra_fields=('num_steps',))
-    summary(dataset, 'hmc', mcmc, time() - start)
+    #summary(dataset, 'hmc', mcmc, time() - start)
+    return mcmc.get_samples()
+def make_predictions(test_data,samples,num_samples):
+    def predict(model, rng_key, samples, *args, **kwargs):
+        model = handlers.substitute(handlers.seed(model, rng_key), samples)
+        # note that Y will be sampled in the model because we pass Y=None here
+        model_trace = handlers.trace(model).get_trace(*args, **kwargs)
+        return model_trace['obs']['value']
+    vmap_args = (samples, random.split(random.PRNGKey(1), num_samples))
+    predictions = vmap(lambda samples, rng_key: predict(model, rng_key, samples, test_data))(*vmap_args)
+    #predictions = predictions[..., 0]
+    return predictions
 
+def roc_curve(predicted_labels,test_labels,alg):
+    "Plot the Receiver Operander Characteristic"
+
+    # calculate the fpr and tpr for all thresholds of the classification
+    #print(predicted_labels.shape)
+    predicted_labels = np.argmax(predicted_labels.T,axis=1)
+    xpredicted_binary = label_binarize(predicted_labels,classes=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    ytest_binary = label_binarize(test_labels, classes=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    n_classes = 10
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = metrics.roc_curve(ytest_binary[:, i], xpredicted_binary[:, i])
+        roc_auc[i] = metrics.auc(fpr[i], tpr[i])
+    class_labels = ["airplane","automobile","bird","cat","deer","dog","frog","horse","ship","truck"]
+    colors = cm.rainbow(np.linspace(0, 1, 10)) #10 classes
+    for i, color, lbl in zip(range(n_classes), colors, class_labels):
+        plt.plot(fpr[i], tpr[i], color=color, lw=1.5,label='ROC Curve of Class {0} (area = {1:0.3f})'.format(lbl, roc_auc[i]))
+
+    # method I: plt
+    plt.plot([0, 1], [0, 1], 'k--', lw=1.5)
+    plt.xlim([-0.05, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve for CIFAR-10 Multi-Class Data')
+    plt.legend(loc='lower right', prop={'size': 6})
+    plt.show()
+    plt.savefig(f'plots/ROC_Curve_CIFAR10_{alg}.pdf')
 
 def main():
     train_data, train_labels, test_data, test_labels = cifar10()
-    hmc('cifar10', train_data[:1000], train_labels[:1000])
+    if args.alg == "NUTS":
+        samples = nuts('cifar10', train_data[:10], train_labels[:10])
+    predicted_labels = make_predictions(test_data[:12],samples,num_samples=10)
+    #predicted_labels = np.array([1,3,1,4,1,6,3,1,5,6,3,3])
+
+    roc_curve(predicted_labels,test_labels[:12],args.alg)
+
+
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="parse args")
+    parser.add_argument('-n', '--num-samples', default=10, type=int, help='number of samples')
+    parser.add_argument('--num-warmup', default=5, type=int, help='number of warmup steps')
+    parser.add_argument('--alg', default="NUTS", type=str, help='inference algorithm')
+    args = parser.parse_args()
     main()

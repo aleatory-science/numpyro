@@ -86,6 +86,7 @@ def visualize(alg, train_data, train_obs, samples, num_samples):
 
 
 def load_agw_1d(get_feats=False):
+    """Dataset from https://arxiv.org/pdf/1907.07504.pdf"""
     def features(x):
         return np.hstack([x[:, None] / 2.0, (x[:, None] / 2.0) ** 2])
 
