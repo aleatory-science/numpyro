@@ -1,16 +1,23 @@
 import argparse
 import os
+from collections import namedtuple
+from time import time
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-from jax import random
+from jax import random, device_get
 
 import numpyro
 import numpyro.distributions as dist
+from numpyro.diagnostics import effective_sample_size, split_gelman_rubin
 from numpyro.infer import Trace_ELBO, SVI, NUTS, MCMC
 from numpyro.infer.autoguide import AutoIAFNormal
 from numpyro.infer.reparam import NeuTraReparam
+
+chain_stats = namedtuple('chain_stats', ['svi_time', 'mcmc_compile_time', 'mcmc_run_time',
+                                         'neff_min', 'neff_median', 'neff_mean',
+                                         'rhat_min', 'rhat_median', 'rhat_mean'])
 
 
 def exp_quad_kernel(x, marginal_std, length_scale, noise_scale):
@@ -36,15 +43,27 @@ def infer_neutra(data, args, rng_key):
     svi_key, mcmc_key = random.split(rng_key)
     guide = AutoIAFNormal(model, num_flows=args.num_flows)
     svi = SVI(model, guide, numpyro.optim.Adam(0.001), Trace_ELBO())
+    start = time()
     params, losses = svi.run(svi_key, args.num_steps, *data)
+    svi_time = time() - start
     plt.plot(losses)
     plt.show()
 
     neutra = NeuTraReparam(guide, params)
     kernel = NUTS(neutra.reparam(model))
     mcmc = MCMC(kernel, args.num_warmup, args.num_samples)
+    start = time()
+    mcmc._compile(mcmc_key, *data)
+    mcmc_compile_time = time() - start
+    start = time()
     mcmc.run(mcmc_key, *data)
+    mcmc_run_time = time() - start
     mcmc.print_summary()
+    n_eff = np.hstack([effective_sample_size(device_get(v)) for v in mcmc.get_samples(True).values()])
+    r_hat = np.hstack([split_gelman_rubin(device_get(v)) for v in mcmc.get_samples(True).values()])
+    return chain_stats(svi_time, mcmc_compile_time, mcmc_run_time,
+                       np.min(n_eff), np.median(n_eff), np.mean(n_eff),
+                       np.min(r_hat), np.median(r_hat), np.mean(r_hat))
 
 
 def gen_data(rng_key, n, d, marginal_std=1., length_scale=1., noise_scale=.1):
