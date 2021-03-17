@@ -3,8 +3,9 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator
+import seaborn as sns
 import numpy as np
-import pandas as pd
 from flax import nn
 from flax.nn.activation import relu, tanh
 from jax import random, vmap
@@ -16,11 +17,8 @@ from numpyro.contrib.module import random_flax_module
 
 from numpyro.infer import MCMC, NUTS, init_to_sample, HMC
 import time
-
-import matplotlib.pyplot as plt
-
 from jax import random
-import jax.numpy as jnp
+
 
 import numpyro
 import numpyro.distributions as dist
@@ -57,16 +55,26 @@ def visualize(alg, train_data, train_obs, samples, num_samples):
 
     # Get upper and lower confidence bounds
     lower, upper = (percentiles[0, :]).flatten(), (percentiles[1, :]).flatten()
-
+    #set color scheme
+    sns.set_style('darkgrid')
+    red =sns.color_palette()[3]
+    blue=sns.color_palette()[0]
+    ax.set_facecolor('#DFE3EE') #grid background color
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2)) #location of grid lines
+    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.grid(which='minor', linewidth=0.5,color="w")
+    ax.set_axisbelow(True) #put grid behind
     # Plot training data as black stars
-    ax.plot(train_data, train_obs, 'x', marker='x', color='forestgreen', rasterized=True, label='Observed Data')
+    ax.plot(train_data, train_obs, 'x', marker='o', color=red, alpha=0.7, markeredgewidth=1., markeredgecolor="k", rasterized=True, label='Observed Data')
     # Plot predictive means as blue line
-    ax.plot(test_data, m, 'b', rasterized=True, label="Mean Prediction")
+    ax.plot(test_data, m, color=blue, rasterized=True, label="Mean Prediction")
     # Shade between the lower and upper confidence bounds
-    ax.fill_between(test_data, lower, upper, alpha=0.5, rasterized=True, label='95% C.I.')
+
+    ax.fill_between(test_data.reshape(-1),lower, upper, alpha=0.5, rasterized=True, label='95% C.I.')
     ax.set_ylim([-2.5, 2.5])
     ax.set_xlim([-2, 2])
-    plt.grid()
+    # plt.grid(True, color='w', linestyle='-', linewidth=2)
+    # plt.gca().patch.set_facecolor('0.8')
     ax.legend(fontsize=fs)
     ax.tick_params(axis='both', which='major', labelsize=14)
     ax.tick_params(axis='both', which='minor', labelsize=14)
@@ -74,7 +82,7 @@ def visualize(alg, train_data, train_obs, samples, num_samples):
     plt.tight_layout()
     plt.savefig(f'plots/regression_{alg}.pdf', rasterized=True)
 
-    plt.show()
+    #plt.show()
 
 
 def load_agw_1d(get_feats=False):
@@ -82,6 +90,7 @@ def load_agw_1d(get_feats=False):
         return np.hstack([x[:, None] / 2.0, (x[:, None] / 2.0) ** 2])
 
     data = np.load(str(Path(__file__).parent / 'data' / 'data.npy'))
+
     x, y = data[:, 0], data[:, 1]
     y = y[:, None]
     f = features(x)
@@ -119,8 +128,8 @@ def model(data, obs=None, subsample_size=None):
     prec_obs = numpyro.sample("prec_obs", dist.LogNormal(jnp.log(110.4), .0001))
     sigma_obs = 1.0 / jnp.sqrt(prec_obs)  # prior
 
-    with numpyro.plate('N', data.shape[0], subsample_size=subsample_size) as idx:
-        numpyro.sample('obs', dist.Normal(net(data[idx]), sigma_obs), obs=obs[idx])
+    with numpyro.plate('N', data.shape[0], subsample_size=subsample_size):
+        numpyro.sample('obs', dist.Normal(net(data), sigma_obs), obs=obs)
 
 
 def benchmark_hmc(args, features, labels):
@@ -132,8 +141,9 @@ def benchmark_hmc(args, features, labels):
     guide = AutoNormal(model)
     svi = SVI(model, guide, numpyro.optim.Adam(0.01), Trace_ELBO())
     params, losses = svi.run(random.PRNGKey(2), 2000, features, labels, subsample_size)
+    plt.title("SVI Error loss")
     plt.plot(losses)
-    plt.show()
+    #plt.show()
     ref_params = svi.guide.sample_posterior(ref_key, params, (1,))
     print(ref_params)
     if args.alg == "HMC":
@@ -156,7 +166,8 @@ def benchmark_hmc(args, features, labels):
         svi = SVI(model, guide, numpyro.optim.Adam(0.01), Trace_ELBO())
         params, losses = svi.run(random.PRNGKey(2), 2000, features, labels, subsample_size)
         plt.plot(losses)
-        plt.show()
+        plt.title("Error Loss")
+        #plt.show()
 
         inner_kernel = NUTS(model, init_strategy=init_to_value(values=ref_params),
                             dense_mass=args.dense_mass)
@@ -179,8 +190,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="parse args")
-    parser.add_argument('-n', '--num-samples', default=1000, type=int, help='number of samples')
-    parser.add_argument('--num-warmup', default=200, type=int, help='number of warmup steps')
+    parser.add_argument('-n', '--num-samples', default=10, type=int, help='number of samples')
+    parser.add_argument('--num-warmup', default=5, type=int, help='number of warmup steps')
     parser.add_argument('--num-steps', default=10, type=int, help='number of steps (for "HMC")')
     parser.add_argument('--num-chains', nargs='?', default=1, type=int)
     parser.add_argument('--alg', default='NUTS', type=str,
