@@ -1,21 +1,20 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
+from collections import namedtuple
 import csv
 import gzip
 import io
 import os
 import pickle
 import struct
-import warnings
-from collections import namedtuple
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 import warnings
 import zipfile
 
 import numpy as np
-import pandas as pd
+
 from jax import device_put, lax
 from jax.interpreters.xla import DeviceArray
 
@@ -238,20 +237,6 @@ def _load_jsb_chorales():
     return processed_dataset
 
 
-<<<<<<< HEAD
-def _load_higgs():
-    warnings.warn("Downloading 2.6 GB dataset")
-    _download(HIGGS)
-    file_path = os.path.join(DATA_DIR, 'HIGGS.csv.gz')
-    df = pd.read_csv(file_path, header=None)
-    obs, feats = df.iloc[:, 0], df.iloc[:, 1:]
-    return obs.to_numpy().astype(int), feats.to_numpy()
-
-
-def _load(dset):
-||||||| c3f2d86a
-def _load(dset):
-=======
 def _load_higgs(num_datapoints):
     warnings.warn("Higgs is a 2.6 GB dataset")
     _download(HIGGS)
@@ -275,7 +260,6 @@ def _load_higgs(num_datapoints):
 
 
 def _load(dset, num_datapoints=-1):
->>>>>>> master
     if dset == BASEBALL:
         return _load_baseball()
     elif dset == COVTYPE:
@@ -292,14 +276,8 @@ def _load(dset, num_datapoints=-1):
         return _load_lynxhare()
     elif dset == JSB_CHORALES:
         return _load_jsb_chorales()
-<<<<<<< HEAD
-    elif dset == HIGGS:
-        return _load_higgs()
-||||||| c3f2d86a
-=======
     elif dset == HIGGS:
         return _load_higgs(num_datapoints)
->>>>>>> master
     raise ValueError('Dataset - {} not found.'.format(dset.name))
 
 

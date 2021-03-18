@@ -7,12 +7,14 @@ from urllib.request import urlretrieve
 import sklearn.metrics as metrics
 from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
+from matplotlib.pyplot import cm
 import numpy as np
+
 from flax import nn
 from flax.nn.activation import selu, softmax
 from jax import random, device_get
 from jax import random, vmap
-from matplotlib.pyplot import cm
+
 from numpyro import handlers
 import numpyro
 import numpyro.distributions as dist
@@ -156,14 +158,10 @@ def make_predictions(test_data,samples,num_samples):
         return model_trace['obs']['value']
     vmap_args = (samples, random.split(random.PRNGKey(1), num_samples))
     predictions = vmap(lambda samples, rng_key: predict(model, rng_key, samples, test_data))(*vmap_args)
-    #predictions = predictions[..., 0]
     return predictions
 
 def roc_curve(predicted_labels,test_labels,alg):
     "Plot the Receiver Operander Characteristic"
-
-    # calculate the fpr and tpr for all thresholds of the classification
-    #print(predicted_labels.shape)
     predicted_labels = np.argmax(predicted_labels.T,axis=1)
     xpredicted_binary = label_binarize(predicted_labels,classes=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
     ytest_binary = label_binarize(test_labels, classes=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
@@ -175,7 +173,7 @@ def roc_curve(predicted_labels,test_labels,alg):
         fpr[i], tpr[i], _ = metrics.roc_curve(ytest_binary[:, i], xpredicted_binary[:, i])
         roc_auc[i] = metrics.auc(fpr[i], tpr[i])
     class_labels = ["airplane","automobile","bird","cat","deer","dog","frog","horse","ship","truck"]
-    colors = cm.rainbow(np.linspace(0, 1, 10)) #10 classes
+    colors = cm.rainbow(np.linspace(0, 1, 10))
     for i, color, lbl in zip(range(n_classes), colors, class_labels):
         plt.plot(fpr[i], tpr[i], color=color, lw=1.5,label='ROC Curve of Class {0} (area = {1:0.3f})'.format(lbl, roc_auc[i]))
 

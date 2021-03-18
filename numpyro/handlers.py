@@ -1,5 +1,6 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
+
 """
 This provides a small set of effect handlers in NumPyro that are modeled
 after Pyro's `poutine <http://docs.pyro.ai/en/stable/poutine.html>`_ module.
@@ -75,13 +76,13 @@ results for all the data points, but does so by using JAX's auto-vectorize trans
    -874.89813
 """
 
-import warnings
 from collections import OrderedDict
-from functools import partial
+import warnings
 
-import jax.numpy as jnp
 import numpy as np
+
 from jax import lax, random
+import jax.numpy as jnp
 
 import numpyro
 from numpyro.distributions.distribution import COERCIONS
@@ -483,6 +484,8 @@ class mask(Messenger):
 
     def process_message(self, msg):
         if msg['type'] != 'sample':
+            if msg["type"] == "inspect":
+                msg["mask"] = self.mask if msg["mask"] is None else (self.mask & msg["mask"])
             return
 
         msg['fn'] = msg['fn'].mask(self.mask)
@@ -656,18 +659,8 @@ class seed(Messenger):
         super(seed, self).__init__(fn)
 
     def process_message(self, msg):
-<<<<<<< HEAD
-        if (msg['type'] == 'sample' and not msg['is_observed'] and
-            msg['kwargs']['rng_key'] is None) or msg['type'] in ['prng_key', 'plate', 'control_flow']:
-            # no need to create a new key when value is available
-||||||| c3f2d86a
-        if (msg['type'] == 'sample' and not msg['is_observed'] and
-                msg['kwargs']['rng_key'] is None) or msg['type'] in ['prng_key', 'plate', 'control_flow']:
-            # no need to create a new key when value is available
-=======
         if (msg['type'] == 'sample' and not msg['is_observed'] and msg['kwargs']['rng_key'] is None) \
                 or msg['type'] in ['prng_key', 'plate', 'control_flow']:
->>>>>>> master
             if msg['value'] is not None:
                 # no need to create a new key when value is available
                 return
@@ -807,5 +800,3 @@ class do(Messenger):
             msg['value'] = intervention
             msg['is_observed'] = True
             msg['stop'] = True
-
-

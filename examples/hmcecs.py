@@ -21,18 +21,22 @@ import argparse
 import time
 
 import matplotlib.pyplot as plt
+from matplotlib.pyplot import cm
 import numpy as np
+import sklearn.metrics as metrics
+from sklearn.preprocessing import label_binarize
 
-from jax import random
+from jax import random,vmap
 import jax.numpy as jnp
 
 import numpyro
 import numpyro.distributions as dist
 from numpyro.examples.datasets import HIGGS, load_dataset
 from numpyro.infer import HMC, HMCECS, MCMC, NUTS, SVI, Trace_ELBO, autoguide
+from numpyro import handlers
 
 
-def model(data, obs, subsample_size):
+def model(data, subsample_size,obs=None):
     n, m = data.shape
     theta = numpyro.sample('theta', dist.Normal(jnp.zeros(m), .5 * jnp.ones(m)))
     with numpyro.plate('N', n, subsample_size=subsample_size):
@@ -48,7 +52,7 @@ def run_hmcecs(hmcecs_key, args, data, obs, inner_kernel):
     optimizer = numpyro.optim.Adam(step_size=1e-3)
     guide = autoguide.AutoDelta(model)
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
-    params, losses = svi.run(svi_key, args.num_svi_steps, data, obs, args.subsample_size)
+    params, losses = svi.run(svi_key, args.num_svi_steps, data,args.subsample_size,obs)
     ref_params = {'theta': params['theta_auto_loc']}
 
     # taylor proxy estimates log likelihood (ll) by
@@ -59,17 +63,16 @@ def run_hmcecs(hmcecs_key, args, data, obs, inner_kernel):
     kernel = HMCECS(inner_kernel, num_blocks=args.num_blocks, proxy=proxy)
     mcmc = MCMC(kernel, num_warmup=args.num_warmup, num_samples=args.num_samples)
 
-    mcmc.run(mcmc_key, data, obs, args.subsample_size)
+    mcmc.run(mcmc_key, data, args.subsample_size,obs)
     mcmc.print_summary()
     return losses, mcmc.get_samples()
 
 
 def run_hmc(mcmc_key, args, data, obs, kernel):
     mcmc = MCMC(kernel, num_warmup=args.num_warmup, num_samples=args.num_samples)
-    mcmc.run(mcmc_key, data, obs, None)
+    mcmc.run(mcmc_key, data, None,obs)
     mcmc.print_summary()
     return mcmc.get_samples()
-
 
 def main(args):
     assert 11_000_000 >= args.num_datapoints, "11,000,000 data points in the Higgs dataset"
@@ -77,8 +80,11 @@ def main(args):
     if args.dataset == 'higgs':
         _, fetch = load_dataset(HIGGS, shuffle=False, num_datapoints=args.num_datapoints)
         data, obs = fetch()
+        data_train, data_test, obs_train, obs_test = data[:100], data[100:120], obs[:100], obs[100:120]
     else:
-        data, obs = (np.random.normal(size=(10, 28)), np.ones(10))
+        data, obs = (np.random.normal(size=(20, 28)), np.ones(20))
+        data_train,data_test,obs_train,obs_test = data[:16], data[16:], obs[:16],obs[16:]
+
 
     hmcecs_key, hmc_key = random.split(random.PRNGKey(args.rng_seed))
 
@@ -89,15 +95,18 @@ def main(args):
         inner_kernel = NUTS(model)
 
     start = time.time()
-    losses, hmcecs_samples = run_hmcecs(hmcecs_key, args, data, obs, inner_kernel)
+    losses, hmcecs_samples = run_hmcecs(hmcecs_key, args, data_train, obs_train, inner_kernel)
     hmcecs_runtime = time.time() - start
 
     start = time.time()
-    hmc_samples = run_hmc(hmc_key, args, data, obs, inner_kernel)
+    hmc_samples = run_hmc(hmc_key, args, data_train, obs_train, inner_kernel)
     hmc_runtime = time.time() - start
 
     summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtime)
-
+    # TODO: Fix predictions, handler not working
+    #predicted_labels = make_predictions(data_test,hmcecs_samples,args.num_samples)
+    predicted_labels=np.array([[0,1,1,1],[0,1,0,1],[0,1,1,1]])
+    roc_curve(predicted_labels,obs_test)
 
 def summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtime):
     fig, ax = plt.subplots(2, 2)
@@ -130,16 +139,45 @@ def summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtim
     fig.tight_layout()
     fig.savefig('hmcecs_plot.pdf', bbox_inches='tight')
 
+def make_predictions(test_data,samples,num_samples):
+    #TODO: Fix , handler not working
+    def predict(model, rng_key, samples, *args, **kwargs):
+        model = handlers.substitute(handlers.seed(model, rng_key), samples)
+        # note that Y will be sampled in the model because we pass Y=None here
+        model_trace = handlers.trace(model).get_trace(*args, **kwargs)
+        return model_trace['obs']['value']
+    vmap_args = (samples, random.split(random.PRNGKey(1), num_samples))
+    predictions = vmap(lambda samples, rng_key: predict(model, rng_key, samples, test_data,args.subsample_size))(*vmap_args)
+    return predictions
+
+def roc_curve(predicted_labels,test_labels):
+    "Plot the Receiver Operander Characteristic"
+
+    predicted_labels = np.argmax(predicted_labels.T,axis=1)
+    fpr,tpr,_ = metrics.roc_curve(test_labels,predicted_labels)
+    roc_auc = metrics.auc(fpr, tpr)
+
+    plt.plot(fpr, tpr, 'b', label='AUC = %0.2f' % roc_auc)
+    # method I: plt
+    plt.plot([0, 1], [0, 1], 'k--', lw=1.5)
+    plt.xlim([-0.05, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic HIGGS dataset')
+    plt.legend(loc='lower right', prop={'size': 6})
+    plt.savefig('hmcecs_ROC.pdf')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("Hamiltonian Monte Carlo with Energy Conserving Subsampling")
-    parser.add_argument('--subsample_size', type=int, default=1300)
-    parser.add_argument('--num_svi_steps', type=int, default=5000)
-    parser.add_argument('--num_blocks', type=int, default=100)
-    parser.add_argument('--num_warmup', type=int, default=500)
-    parser.add_argument('--num_samples', type=int, default=500)
+    parser.add_argument('--subsample_size', type=int, default=2) #1300
+    parser.add_argument('--num_svi_steps', type=int, default=5000) #5000
+    parser.add_argument('--num_blocks', type=int, default=100) #100
+    parser.add_argument('--num_warmup', type=int, default=500) #500
+    parser.add_argument('--num_samples', type=int, default=500) #500
     parser.add_argument('--num_datapoints', type=int, default=1_500_000)
-    parser.add_argument('--dataset', type=str, choices=['higgs', 'mock'], default='higgs')
+    parser.add_argument('--dataset', type=str, choices=['higgs', 'mock'], default='mock')
     parser.add_argument('--inner_kernel', type=str, choices=['nuts', 'hmc'], default='nuts')
     parser.add_argument('--device', default='cpu', type=str, choices=['cpu', 'gpu'])
     parser.add_argument('--rng_seed', default=37, type=int, help='random number generator seed')
