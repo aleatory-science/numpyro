@@ -357,10 +357,16 @@ class MCMC(object):
         # so we only need to filter out the case site_value.shape[0] == 0
         # (which happens when lower_idx==upper_idx)
         if len(site_values) > 0 and jnp.shape(site_values[0])[0] > 0:
+<<<<<<< HEAD
             if self._jit_model_args:
                 states[self._sample_field] = postprocess_fn(states[self._sample_field], args, kwargs)
             else:
                 states[self._sample_field] = postprocess_fn(states[self._sample_field])
+=======
+            if self.chain_method == "vectorized" and self.num_chains > 1:
+                postprocess_fn = vmap(postprocess_fn)
+            states[self._sample_field] = lax.map(postprocess_fn, states[self._sample_field])
+>>>>>>> af44db1157bd5867dd9b15bb3e664d5f61003465
         return states, last_state
 
     def _set_collection_params(self, lower=None, upper=None, collection_size=None, phase=None):
