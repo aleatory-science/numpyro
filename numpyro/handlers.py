@@ -382,7 +382,7 @@ class condition(Messenger):
 
 class infer_config(Messenger):
     """
-    Given a callable `fn` that contains Pyro primitive calls
+    Given a callable `fn` that contains NumPyro primitive calls
     and a callable `config_fn` taking a trace site and returning a dictionary,
     updates the value of the infer kwarg at a sample site to config_fn(site).
 
@@ -656,10 +656,20 @@ class seed(Messenger):
         super(seed, self).__init__(fn)
 
     def process_message(self, msg):
+<<<<<<< HEAD
         if (msg['type'] == 'sample' and not msg['is_observed'] and
             msg['kwargs']['rng_key'] is None) or msg['type'] in ['prng_key', 'plate', 'control_flow']:
             # no need to create a new key when value is available
+||||||| c3f2d86a
+        if (msg['type'] == 'sample' and not msg['is_observed'] and
+                msg['kwargs']['rng_key'] is None) or msg['type'] in ['prng_key', 'plate', 'control_flow']:
+            # no need to create a new key when value is available
+=======
+        if (msg['type'] == 'sample' and not msg['is_observed'] and msg['kwargs']['rng_key'] is None) \
+                or msg['type'] in ['prng_key', 'plate', 'control_flow']:
+>>>>>>> master
             if msg['value'] is not None:
+                # no need to create a new key when value is available
                 return
             self.rng_key, rng_key_sample = random.split(self.rng_key)
             msg['kwargs']['rng_key'] = rng_key_sample

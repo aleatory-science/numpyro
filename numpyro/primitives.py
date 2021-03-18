@@ -89,7 +89,21 @@ class Messenger(object):
             return self.fn(*args, **kwargs)
 
 
-def sample(name, fn, obs=None, rng_key=None, sample_shape=(), infer=None):
+def _masked_observe(name, fn, obs, obs_mask, **kwargs):
+    # Split into two auxiliary sample sites.
+    with numpyro.handlers.mask(mask=obs_mask):
+        observed = sample(f"{name}_observed", fn, **kwargs, obs=obs)
+    with numpyro.handlers.mask(mask=(obs_mask ^ True)):
+        unobserved = sample(f"{name}_unobserved", fn, **kwargs)
+
+    # Interleave observed and unobserved events.
+    shape = jnp.shape(obs_mask) + (1,) * fn.event_dim
+    batch_mask = jnp.reshape(obs_mask, shape)
+    value = jnp.where(batch_mask, observed, unobserved)
+    return deterministic(name, value)
+
+
+def sample(name, fn, obs=None, rng_key=None, sample_shape=(), infer=None, obs_mask=None):
     """
     Returns a random sample from the stochastic function `fn`. This can have
     additional side effects when wrapped inside effect handlers like
@@ -110,11 +124,19 @@ def sample(name, fn, obs=None, rng_key=None, sample_shape=(), infer=None):
         for inference algorithms. For example, if `fn` is a discrete distribution,
         setting `infer={'enumerate': 'parallel'}` to tell MCMC marginalize
         this discrete latent site.
+    :param numpy.ndarray obs_mask: Optional boolean array mask of shape
+        broadcastable with ``fn.batch_shape``. If provided, events with
+        mask=True will be conditioned on ``obs`` and remaining events will be
+        imputed by sampling. This introduces a latent sample site named ``name
+        + "_unobserved"`` which should be used by guides.
     :return: sample from the stochastic `fn`.
     """
     # if there are no active Messengers, we just draw a sample and return it as expected:
     if not _PYRO_STACK:
         return fn(rng_key=rng_key, sample_shape=sample_shape)
+
+    if obs_mask is not None:
+        return _masked_observe(name, fn, obs, obs_mask, rng_key=rng_key, sample_shape=(), infer=infer)
 
     # Otherwise, we initialize a message...
     initial_msg = {
@@ -313,7 +335,12 @@ class plate(Messenger):
         }
         apply_stack(msg)
         subsample = msg['value']
+<<<<<<< HEAD
         subsample_size = msg['args'][1]  # TODO: rewrite plate
+||||||| c3f2d86a
+=======
+        subsample_size = msg['args'][1]
+>>>>>>> master
         if subsample_size is not None and subsample_size != subsample.shape[0]:
             warnings.warn("subsample_size does not match len(subsample), {} vs {}.".format(
                 subsample_size, len(subsample)) +

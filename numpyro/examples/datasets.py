@@ -3,6 +3,7 @@
 
 import csv
 import gzip
+import io
 import os
 import pickle
 import struct
@@ -10,6 +11,7 @@ import warnings
 from collections import namedtuple
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
+import warnings
 import zipfile
 
 import numpy as np
@@ -34,11 +36,9 @@ COVTYPE = dset('covtype', [
     'https://d2hg8soec8ck9v.cloudfront.net/datasets/covtype.zip',
 ])
 
-
 DIPPER_VOLE = dset('dipper_vole', [
     'https://github.com/pyro-ppl/datasets/blob/master/dipper_vole.zip?raw=true',
 ])
-
 
 MNIST = dset('mnist', [
     'https://d2hg8soec8ck9v.cloudfront.net/datasets/mnist/train-images-idx3-ubyte.gz',
@@ -238,6 +238,7 @@ def _load_jsb_chorales():
     return processed_dataset
 
 
+<<<<<<< HEAD
 def _load_higgs():
     warnings.warn("Downloading 2.6 GB dataset")
     _download(HIGGS)
@@ -248,6 +249,33 @@ def _load_higgs():
 
 
 def _load(dset):
+||||||| c3f2d86a
+def _load(dset):
+=======
+def _load_higgs(num_datapoints):
+    warnings.warn("Higgs is a 2.6 GB dataset")
+    _download(HIGGS)
+
+    file_path = os.path.join(DATA_DIR, 'HIGGS.csv.gz')
+    with io.TextIOWrapper(gzip.open(file_path, 'rb')) as f:
+        csv_reader = csv.reader(f, delimiter=',', quoting=csv.QUOTE_NONE)
+        obs = []
+        data = []
+        for i, row in enumerate(csv_reader):
+            obs.append(int(float(row[0])))
+            data.append([float(v) for v in row[1:]])
+            if num_datapoints and i > num_datapoints:
+                break
+    obs = np.stack(obs)
+    data = np.stack(data)
+    n, = obs.shape
+
+    return {'train': (data[:-(n//20)], obs[:-(n//20)]),
+            'test': (data[-(n//20):], obs[-(n//20):])}  # standard split -500_000: as test
+
+
+def _load(dset, num_datapoints=-1):
+>>>>>>> master
     if dset == BASEBALL:
         return _load_baseball()
     elif dset == COVTYPE:
@@ -264,8 +292,14 @@ def _load(dset):
         return _load_lynxhare()
     elif dset == JSB_CHORALES:
         return _load_jsb_chorales()
+<<<<<<< HEAD
     elif dset == HIGGS:
         return _load_higgs()
+||||||| c3f2d86a
+=======
+    elif dset == HIGGS:
+        return _load_higgs(num_datapoints)
+>>>>>>> master
     raise ValueError('Dataset - {} not found.'.format(dset.name))
 
 
@@ -283,8 +317,8 @@ def iter_dataset(dset, batch_size=None, split='train', shuffle=True):
         yield tuple(a[idxs[start_idx:end_idx]] for a in arrays)
 
 
-def load_dataset(dset, batch_size=None, split='train', shuffle=True):
-    arrays = _load(dset)[split]
+def load_dataset(dset, batch_size=None, split='train', shuffle=True, num_datapoints=None):
+    arrays = _load(dset, num_datapoints)[split]
     num_records = len(arrays[0])
     idxs = np.arange(num_records)
     if not batch_size:
