@@ -565,7 +565,8 @@ class MCMC(object):
             if isinstance(state_sample_field, dict):
                 sites = {k: v for k, v in self._states[self._sample_field].items()
                          if k in state_sample_field}
-        print_summary(sites, prob=prob)
+        summary_dict = print_summary(sites, prob=prob)
         extra_fields = self.get_extra_fields()
         if 'diverging' in extra_fields:
             print("Number of divergences: {}".format(jnp.sum(extra_fields['diverging'])))
+        return summary_dict

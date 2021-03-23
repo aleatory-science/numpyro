@@ -300,3 +300,4 @@ def print_summary(samples, prob=0.90, group_by_chain=True):
                 idx_str = '[{}]'.format(','.join(map(str, idx)))
                 print(row_format.format(name + idx_str, *[v[idx] for v in stats_dict.values()]))
     print()
+    return summary_dict
