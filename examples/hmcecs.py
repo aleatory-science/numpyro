@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from matplotlib.pyplot import cm
 import numpy as np
 import sklearn.metrics as metrics
-from sklearn.preprocessing import label_binarize
+from collections import defaultdict
 
 from jax import random,vmap
 import jax.numpy as jnp
@@ -32,7 +32,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.examples.datasets import HIGGS, load_dataset
-from numpyro.infer import HMC, HMCECS, MCMC, NUTS, SVI, Trace_ELBO, autoguide
+from numpyro.infer import HMC, HMCECS, MCMC, NUTS, SVI, Trace_ELBO, autoguide, Predictive
 from numpyro import handlers
 
 
@@ -66,15 +66,15 @@ def run_hmcecs(hmcecs_key, args, data, obs, inner_kernel):
     mcmc = MCMC(kernel, num_warmup=args.num_warmup, num_samples=args.num_samples)
 
     mcmc.run(mcmc_key, data, args.subsample_size,obs)
-    mcmc.print_summary()
-    return losses, mcmc.get_samples()
+    summary_dict = mcmc.print_summary()
+    return losses, mcmc.get_samples(),summary_dict
 
 
 def run_hmc(mcmc_key, args, data, obs, kernel):
     mcmc = MCMC(kernel, num_warmup=args.num_warmup, num_samples=args.num_samples)
     mcmc.run(mcmc_key, data, None,obs)
-    mcmc.print_summary()
-    return mcmc.get_samples()
+    summary_dict = mcmc.print_summary()
+    return mcmc.get_samples(),summary_dict
 
 def main(args):
     assert 11_000_000 >= args.num_datapoints, "11,000,000 data points in the Higgs dataset"
@@ -88,27 +88,44 @@ def main(args):
         data_train,data_test,obs_train,obs_test = data[:16], data[16:], obs[:16],obs[16:]
 
 
-    hmcecs_key, hmc_key = random.split(random.PRNGKey(args.rng_seed))
+    hmcecs_key1,hmcecs_key2,hmcecs_key3, hmc_key, pred_key = random.split(random.PRNGKey(args.rng_seed),5)
 
     # choose inner_kernel
     if args.inner_kernel == 'hmc':
         inner_kernel = HMC(model)
     else:
         inner_kernel = NUTS(model)
+    sampling_keys = [hmcecs_key1,hmcecs_key2,hmcecs_key3]
+    hmcecs_dict_samples = {}
+    for i, rnd_key in zip(list(range(3)),sampling_keys):
+        print("HMC-ECS run number {}".format(i))
+        start = time.time()
+
+        losses, hmcecs_samples,hmcecs_sum_dict = run_hmcecs(rnd_key, args, data_train, obs_train, inner_kernel)
+        hmcecs_runtime = time.time() - start
+        hmcecs_dict_samples["Run_{}".format(i)] = hmcecs_samples["theta"]
 
     start = time.time()
-    losses, hmcecs_samples = run_hmcecs(hmcecs_key, args, data_train, obs_train, inner_kernel)
-    hmcecs_runtime = time.time() - start
-
-    start = time.time()
-    hmc_samples = run_hmc(hmc_key, args, data_train, obs_train, inner_kernel)
+    hmc_samples,hmc_sum_dict = run_hmc(hmc_key, args, data_train, obs_train, inner_kernel)
     hmc_runtime = time.time() - start
-
-    summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtime)
+    convergence_plot(hmc_samples,hmcecs_dict_samples)
+    exit()
+    summary_plot(losses, hmc_samples, hmcecs_samples[0], hmc_runtime, hmcecs_runtime)
     # TODO: Fix predictions, handler not working
-    #predicted_labels = make_predictions(data_test,hmcecs_samples,args.num_samples)
+    #predicted_labels = make_predictions(data_test,hmcecs_samples,args.num_samples,pred_key)
+    exit()
     predicted_labels=np.array([[0,1,1,1],[0,1,0,1],[0,1,1,1]])
     roc_curve(predicted_labels,obs_test)
+
+def convergence_plot(hmc_samples,hmcecs_samples):
+    n = len(hmcecs_samples) +1
+    colors = cm.rainbow(np.linspace(0,1,n))
+    for i,(run,samples) in enumerate(hmcecs_samples.items()):
+        plt.plot(list(range(samples.shape[0])),samples[:,0],color=colors[i],label="HMC-ECS {}".format(i))
+    plt.plot(list(range(hmc_samples["theta"].shape[0])),hmc_samples["theta"][:,0], color=colors[-1],label="HMC")
+    plt.legend()
+    plt.title("Convergence plot")
+    plt.savefig("convergence.pdf")
 
 def summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtime):
     fig, ax = plt.subplots(2, 2)
@@ -139,18 +156,22 @@ def summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtim
         a.set_xticks([])
 
     fig.tight_layout()
-    fig.savefig('hmcecs_plot.pdf', bbox_inches='tight')
+    fig.savefig('hmcecs_summary_plot.pdf', bbox_inches='tight')
 
-def make_predictions(test_data,samples,num_samples):
+def make_predictions(test_data,samples,num_samples,key):
     #TODO: Fix , handler not working
-    def predict(model, rng_key, samples, *args, **kwargs):
-        model = handlers.substitute(handlers.seed(model, rng_key), samples)
-        # note that Y will be sampled in the model because we pass Y=None here
-        model_trace = handlers.trace(model).get_trace(*args, **kwargs)
-        return model_trace['obs']['value']
-    vmap_args = (samples, random.split(random.PRNGKey(1), num_samples))
-    predictions = vmap(lambda samples, rng_key: predict(model, rng_key, samples, test_data,args.subsample_size))(*vmap_args)
-    return predictions
+    # def predict(model, rng_key, samples, *args, **kwargs):
+    #     model = handlers.substitute(handlers.seed(model, rng_key), samples)
+    #     # note that Y will be sampled in the model because we pass Y=None here
+    #     model_trace = handlers.trace(model).get_trace(*args, **kwargs)
+    #     return model_trace['obs']['value']
+    # vmap_args = (samples, random.split(random.PRNGKey(1), num_samples))
+    # predictions = vmap(lambda samples, rng_key: predict(model, rng_key, samples, test_data,args.subsample_size))(*vmap_args)
+    # return predictions
+    pred_fn = Predictive(model,samples,num_samples=num_samples)
+
+    pred = pred_fn(key,test_data,args.subsample_size)
+
 
 def roc_curve(predicted_labels,test_labels):
     "Plot the Receiver Operander Characteristic"

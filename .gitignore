@@ -17,6 +17,7 @@ build
 
 # data files
 *.pdf
+*.png
 numpyro/examples/.data
 examples/.results
 examples/*.pdf
@@ -37,3 +38,4 @@ docs/.DS_Store
 
 examples/HIGGS.csv.gz
 examples/PLOTS*
+
