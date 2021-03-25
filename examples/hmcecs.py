@@ -44,7 +44,7 @@ def model(data, subsample_size,obs=None):
         batch_obs = None
         if obs is not None:
             batch_obs = numpyro.subsample(obs, event_dim=0)
-        numpyro.sample('obs', dist.Bernoulli(logits=theta @ batch_feats.T), obs=batch_obs)
+        numpyro.sample('labels', dist.Bernoulli(logits=theta @ batch_feats.T), obs=batch_obs)
 
 
 def run_hmcecs(hmcecs_key, args, data, obs, inner_kernel):
@@ -97,10 +97,9 @@ def main(args):
         inner_kernel = NUTS(model)
     sampling_keys = [hmcecs_key1,hmcecs_key2,hmcecs_key3]
     hmcecs_dict_samples = {}
-    for i, rnd_key in zip(list(range(3)),sampling_keys):
+    for i, rnd_key in zip(list(range(1)),sampling_keys):
         print("HMC-ECS run number {}".format(i))
         start = time.time()
-
         losses, hmcecs_samples,hmcecs_sum_dict = run_hmcecs(rnd_key, args, data_train, obs_train, inner_kernel)
         hmcecs_runtime = time.time() - start
         hmcecs_dict_samples["Run_{}".format(i)] = hmcecs_samples["theta"]
@@ -108,14 +107,13 @@ def main(args):
     start = time.time()
     hmc_samples,hmc_sum_dict = run_hmc(hmc_key, args, data_train, obs_train, inner_kernel)
     hmc_runtime = time.time() - start
-    convergence_plot(hmc_samples,hmcecs_dict_samples)
-    exit()
-    summary_plot(losses, hmc_samples, hmcecs_samples[0], hmc_runtime, hmcecs_runtime)
-    # TODO: Fix predictions, handler not working
-    #predicted_labels = make_predictions(data_test,hmcecs_samples,args.num_samples,pred_key)
-    exit()
-    predicted_labels=np.array([[0,1,1,1],[0,1,0,1],[0,1,1,1]])
-    roc_curve(predicted_labels,obs_test)
+
+    #convergence_plot(hmc_samples,hmcecs_dict_samples)
+    #summary_plot(losses, hmc_samples, hmcecs_samples[0], hmc_runtime, hmcecs_runtime)
+    predicted_labels = make_predictions(data_test,hmcecs_samples,args.num_samples,pred_key)
+
+    #predicted_labels=np.array([[0,1,1,1],[0,1,0,1],[0,1,1,1]])
+    roc_curve(predicted_labels["labels"],obs_test)
 
 def convergence_plot(hmc_samples,hmcecs_samples):
     n = len(hmcecs_samples) +1
@@ -159,29 +157,19 @@ def summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtim
     fig.savefig('hmcecs_summary_plot.pdf', bbox_inches='tight')
 
 def make_predictions(test_data,samples,num_samples,key):
-    #TODO: Fix , handler not working
-    # def predict(model, rng_key, samples, *args, **kwargs):
-    #     model = handlers.substitute(handlers.seed(model, rng_key), samples)
-    #     # note that Y will be sampled in the model because we pass Y=None here
-    #     model_trace = handlers.trace(model).get_trace(*args, **kwargs)
-    #     return model_trace['obs']['value']
-    # vmap_args = (samples, random.split(random.PRNGKey(1), num_samples))
-    # predictions = vmap(lambda samples, rng_key: predict(model, rng_key, samples, test_data,args.subsample_size))(*vmap_args)
-    # return predictions
+    "Makes predictions for the subsampling."
     pred_fn = Predictive(model,samples,num_samples=num_samples)
-
-    pred = pred_fn(key,test_data,args.subsample_size)
-
+    pred = pred_fn(key,test_data,test_data.shape[0])
+    return pred
 
 def roc_curve(predicted_labels,test_labels):
     "Plot the Receiver Operander Characteristic"
-
     predicted_labels = np.argmax(predicted_labels.T,axis=1)
     fpr,tpr,_ = metrics.roc_curve(test_labels,predicted_labels)
     roc_auc = metrics.auc(fpr, tpr)
 
     plt.plot(fpr, tpr, 'b', label='AUC = %0.2f' % roc_auc)
-    # method I: plt
+
     plt.plot([0, 1], [0, 1], 'k--', lw=1.5)
     plt.xlim([-0.05, 1.0])
     plt.ylim([0.0, 1.05])
