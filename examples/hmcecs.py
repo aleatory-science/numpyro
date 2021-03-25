@@ -41,7 +41,9 @@ def model(data, subsample_size,obs=None):
     theta = numpyro.sample('theta', dist.Normal(jnp.zeros(m), .5 * jnp.ones(m)))
     with numpyro.plate('N', n, subsample_size=subsample_size):
         batch_feats = numpyro.subsample(data, event_dim=1)
-        batch_obs = numpyro.subsample(obs, event_dim=0)
+        batch_obs = None
+        if obs is not None:
+            batch_obs = numpyro.subsample(obs, event_dim=0)
         numpyro.sample('obs', dist.Bernoulli(logits=theta @ batch_feats.T), obs=batch_obs)
 
 
