@@ -198,10 +198,24 @@ def benchmark_hmc(args, features, labels):
     mcmc.print_summary(exclude_deterministic=False)
     print("\nMCMC elapsed time:", time.time() - start)
 
+def benchmark_divide_and_conquer(args, features, labels):
+    rng_key = random.PRNGKey(1)
+    start = time.time()
+    args.num_shards
+    sub_features = jnp.split(features)
+    sub_features = jnp.split(features)
+    print("\nMCMC elapsed time:", time.time() - start)
+
+
 
 def main(args):
     features, labels = _load_dataset()
-    benchmark_hmc(args, features, labels)
+    if args.algo == 'consensus':
+        benchmark = benchmark_divide_and_conquer
+    else:
+        benchmark = benchmark_hmc
+
+    benchmark(args, features, labels)
 
 
 if __name__ == "__main__":
@@ -223,6 +237,7 @@ if __name__ == "__main__":
         type=str,
         help='whether to run "HMC", "NUTS", "HMCECS", "SA" or "FlowHMCECS"',
     )
+    parser.add_argument('--num-shards', default=10, type=int, help='number of shards (for consensus).')
     parser.add_argument("--dense-mass", action="store_true")
     parser.add_argument("--x64", action="store_true")
     parser.add_argument("--device", default="cpu", type=str, help='use "cpu" or "gpu".')
