@@ -26,7 +26,9 @@ This example illustrates the usages of various MCMC methods which are suitable f
 
 import argparse
 import time
+from multiprocessing import cpu_count
 
+import jax
 import matplotlib.pyplot as plt
 
 from jax import random
@@ -34,9 +36,11 @@ import jax.numpy as jnp
 
 import numpyro
 import numpyro.distributions as dist
+from numpyro import set_host_device_count
 from numpyro.examples.datasets import COVTYPE, load_dataset
 from numpyro.infer import HMC, HMCECS, MCMC, NUTS, SA, SVI, Trace_ELBO, init_to_value
 from numpyro.infer.autoguide import AutoBNAFNormal
+from numpyro.infer.hmc_util import consensus
 from numpyro.infer.reparam import NeuTraReparam
 
 
@@ -198,14 +202,34 @@ def benchmark_hmc(args, features, labels):
     mcmc.print_summary(exclude_deterministic=False)
     print("\nMCMC elapsed time:", time.time() - start)
 
+
 def benchmark_divide_and_conquer(args, features, labels):
     rng_key = random.PRNGKey(1)
-    start = time.time()
-    args.num_shards
-    sub_features = jnp.split(features)
-    sub_features = jnp.split(features)
-    print("\nMCMC elapsed time:", time.time() - start)
+    sub_features = jnp.split(features, args.num_shards)
+    sub_labels = jnp.split(labels, args.num_shards)
 
+    step_size = jnp.sqrt(0.5 / features.shape[0])
+    trajectory_length = step_size * args.num_steps
+    run_keys = random.split(rng_key, args.num_shards)
+
+    kernel = HMC(
+        model,
+        step_size=step_size,
+        trajectory_length=trajectory_length,
+        adapt_step_size=False,
+        dense_mass=args.dense_mass,
+    )
+
+    start = time.time()
+    mcmcs = [MCMC(kernel, args.num_warmup, args.num_samples) for _ in range(args.num_shards)]
+
+    for i, mcmc in enumerate(mcmcs):
+        mcmc.run(run_keys[i], sub_features[i], sub_labels[i])
+
+    samples = [mcmc.get_samples() for mcmc in mcmcs]
+    merged_post = consensus(samples)
+
+    print("\nConsensus elapsed time:", time.time() - start)
 
 
 def main(args):
@@ -221,30 +245,20 @@ def main(args):
 if __name__ == "__main__":
     assert numpyro.__version__.startswith("0.6.0")
     parser = argparse.ArgumentParser(description="parse args")
-    parser.add_argument(
-        "-n", "--num-samples", default=1000, type=int, help="number of samples"
-    )
-    parser.add_argument(
-        "--num-warmup", default=1000, type=int, help="number of warmup steps"
-    )
-    parser.add_argument(
-        "--num-steps", default=10, type=int, help='number of steps (for "HMC")'
-    )
+    parser.add_argument("-n", "--num-samples", default=10, type=int, help="number of samples")
+    parser.add_argument("--num-warmup", default=10, type=int, help="number of warmup steps")
+    parser.add_argument("--num-steps", default=10, type=int, help='number of steps (for "HMC")')
     parser.add_argument("--num-chains", nargs="?", default=1, type=int)
-    parser.add_argument(
-        "--algo",
-        default="HMCECS",
-        type=str,
-        help='whether to run "HMC", "NUTS", "HMCECS", "SA" or "FlowHMCECS"',
-    )
-    parser.add_argument('--num-shards', default=10, type=int, help='number of shards (for consensus).')
+    parser.add_argument("--algo", default="consensus",
+                        type=str, choices=["HMC", "NUTS", "HMCECS", "SA", "FlowHMCECS", "consensus"])
+    parser.add_argument('--num-shards', default=4, type=int, help='number of shards (for consensus).')
     parser.add_argument("--dense-mass", action="store_true")
     parser.add_argument("--x64", action="store_true")
     parser.add_argument("--device", default="cpu", type=str, help='use "cpu" or "gpu".')
     args = parser.parse_args()
 
     numpyro.set_platform(args.device)
-    numpyro.set_host_device_count(args.num_chains)
+    set_host_device_count(cpu_count())
     if args.x64:
         numpyro.enable_x64()
 
