@@ -223,11 +223,11 @@ def benchmark_divide_and_conquer(args, features, labels):
     start = time.time()
     mcmcs = [MCMC(kernel, args.num_warmup, args.num_samples) for _ in range(args.num_shards)]
 
-    for i, mcmc in enumerate(mcmcs):
+    for i, mcmc in enumerate(mcmcs):  # parallel: similar to MCMC multi chains with different data?
         mcmc.run(run_keys[i], sub_features[i], sub_labels[i])
 
     samples = [mcmc.get_samples() for mcmc in mcmcs]
-    merged_post = consensus(samples)
+    consensus(samples)
 
     print("\nConsensus elapsed time:", time.time() - start)
 
