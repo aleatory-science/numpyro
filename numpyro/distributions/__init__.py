@@ -1,11 +1,7 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from numpyro.distributions.conjugate import (
-    BetaBinomial,
-    DirichletMultinomial,
-    GammaPoisson,
-)
+from numpyro.distributions.conjugate import BetaBinomial, DirichletMultinomial, GammaPoisson
 from numpyro.distributions.continuous import (
     LKJ,
     Beta,
@@ -29,7 +25,7 @@ from numpyro.distributions.continuous import (
     Pareto,
     SoftLaplace,
     StudentT,
-    Uniform,
+    Uniform
 )
 from numpyro.distributions.directional import ProjectedNormal, VonMises
 from numpyro.distributions.discrete import (
@@ -52,7 +48,7 @@ from numpyro.distributions.discrete import (
     Poisson,
     PRNGIdentity,
     ZeroInflatedDistribution,
-    ZeroInflatedPoisson,
+    ZeroInflatedPoisson
 )
 from numpyro.distributions.distribution import (
     Delta,
@@ -62,7 +58,7 @@ from numpyro.distributions.distribution import (
     Independent,
     MaskedDistribution,
     TransformedDistribution,
-    Unit,
+    Unit
 )
 from numpyro.distributions.kl import kl_divergence
 from numpyro.distributions.transforms import biject_to
@@ -73,7 +69,7 @@ from numpyro.distributions.truncated import (
     TruncatedDistribution,
     TruncatedNormal,
     TruncatedPolyaGamma,
-    TwoSidedTruncatedDistribution,
+    TwoSidedTruncatedDistribution
 )
 
 from . import constraints, transforms
