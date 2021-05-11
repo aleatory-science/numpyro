@@ -1,16 +1,14 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections import defaultdict, namedtuple
 import copy
-from functools import partial
 import warnings
+from collections import defaultdict, namedtuple
+from functools import partial
 
-import numpy as np
-
-import jax
-from jax import device_put, grad, hessian, jacfwd, jacobian, lax, ops, random, value_and_grad, vmap
 import jax.numpy as jnp
+import numpy as np
+from jax import device_put, grad, hessian, jacfwd, jacobian, lax, ops, random, value_and_grad, vmap
 from jax.scipy.special import expit
 
 import numpyro
@@ -922,7 +920,7 @@ def variational_proxy(guide, guide_params, num_particles=10):
                                 site["fn"].log_prob(site["value"]), frame.dim)
             return log_lik
 
-        def log_posterior(params):
+        def log_variational(params):
             with warnings.catch_warnings():
                 warnings.filterwarnings('ignore', category=UserWarning)
                 dummy_subsample = {k: jnp.array([], dtype=jnp.int32) for k in subsample_plate_sizes}
@@ -942,22 +940,23 @@ def variational_proxy(guide, guide_params, num_particles=10):
                         if site["type"] == "sample" and not site["is_observed"]]
         posterior_samples = _predictive(pos_key, guide_with_params, {}, (num_particles,), return_sites=return_sites,
                                         parallel=True, model_args=model_args, model_kwargs=model_kwargs)
+
         log_likelihood_ref = vmap(log_likelihood)(posterior_samples)
-        log_likelihood_ref = {k: v / num_particles for k, v in log_likelihood_ref.items()}
+        log_likelihood_ref = {k: v for k, v in log_likelihood_ref.items()}
 
-        log_prior_prob = vmap(log_prior)(posterior_samples) / num_particles
-        log_posterior_prob = vmap(log_posterior)(posterior_samples) / num_particles
+        log_prior_prob = vmap(log_prior)(posterior_samples)
+        log_var_prob = vmap(log_variational)(posterior_samples)
 
-        # softmax(E_{z~Q}[l(x_i,z)])
-        weights = {name: jax.nn.softmax(jnp.exp(log_posterior_prob / num_particles) @ log_like / num_particles) for
-                   name, log_like in
-                   log_likelihood_ref.items()}
+        exp_likelihood = {name: jnp.exp(log_var_prob) * log_like / num_particles
+                          for name, log_like in log_likelihood_ref.items()}
+        # w_i = E_{z~Q}[l(x_i,z)] / sum_j(E_{z~Q}[l(x_j,z)])
+        weights = {name: exp_likelihood[name] / exp_likelihood[name].sum()
+                   for name, log_like in log_likelihood_ref.items()}
 
-        # ELBO = exp(log(Q(z)) @ (log(L(z)) + log(pi(z)) - log(Q(z)))
-        elbo = {
-            name: jnp.exp(log_posterior_prob / num_particles) @ (
-                    log_prior_prob + log_like.sum(1) - log_posterior_prob) / num_particles
-            for name, log_like in log_likelihood_ref.items()}
+        # ELBO E_{z~Q}[l(z) + log(pi(z)) - log(q(z))]
+        elbo = {name: exp_likelihood[name].sum() +  # TODO: use ELBO implementation from NumPyro
+                      (jnp.exp(log_var_prob) / num_particles * (log_prior_prob - log_var_prob)).sum() for name in
+                log_likelihood_ref.keys()}
 
         def gibbs_init(rng_key, gibbs_sites):
             return VariationalProxyState(
@@ -983,7 +982,7 @@ def variational_proxy(guide, guide_params, num_particles=10):
             proxy_subsample = {}
             # TODO: convert params to constrained space
             log_prior_prob = log_prior(params)
-            log_posterior_prob = log_posterior(params)
+            log_posterior_prob = log_variational(params)
 
             for name in subsample_lik_sites:
                 # Q(z) = L(z)pi(z)/p(x) => L(z) = p(x)/Q(z)pi(z) >= exp(elbo)/Q(z)pi(z) =>
