@@ -603,7 +603,7 @@ class HMCECS(HMCGibbs):
 
     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs.copy()
-        rng_key, key_u = random.split(rng_key)
+        rng_key, key_u, key_proxy = random.split(rng_key, 3)
         self._prototype_trace = trace(seed(self.model, key_u)).get_trace(
             *model_args, **model_kwargs
         )
@@ -616,6 +616,7 @@ class HMCECS(HMCGibbs):
         assert self._gibbs_sites, "Cannot detect any subsample statements in the model."
         if self._proxy is not None:
             proxy_fn, gibbs_init, self._gibbs_update = self._proxy(
+                key_proxy,
                 self._prototype_trace,
                 self._subsample_plate_sizes,
                 self.model,
@@ -692,6 +693,10 @@ class HMCECS(HMCGibbs):
     def taylor_proxy(reference_params):
         return taylor_proxy(reference_params)
 
+    @staticmethod
+    def variational_proxy(guide, guide_params, num_particles=10):
+        return variational_proxy(guide, guide_params, num_particles)
+
 
 def perturbed_method(subsample_plate_sizes, proxy_fn):
     def estimator(likelihoods, params, gibbs_state):
@@ -707,10 +712,7 @@ def perturbed_method(subsample_plate_sizes, proxy_fn):
             params, subsample_log_liks.keys(), gibbs_state
         )
 
-        for (
-                name,
-                subsample_log_lik,
-        ) in subsample_log_liks.items():  # loop over all subsample sites
+        for name, subsample_log_lik in subsample_log_liks.items():  # loop over all subsample sites
             n, m = subsample_plate_sizes[name]
 
             diff = subsample_log_lik - proxy_value_subsample[name]
@@ -736,6 +738,7 @@ def taylor_proxy(reference_params):
     """
 
     def construct_proxy_fn(
+            rng_key,
             prototype_trace,
             subsample_plate_sizes,
             model,
@@ -886,17 +889,17 @@ def taylor_proxy(reference_params):
 
 
 def variational_proxy(guide, guide_params, num_particles=10):
-    def construct_proxy_fn(rng_key, model, model_args, model_kwargs, num_blocks=1):
+    def construct_proxy_fn(
+            rng_key,
+            prototype_trace,
+            subsample_plate_sizes,
+            model,
+            model_args,
+            model_kwargs,
+            num_blocks=1,
+    ):
         # TODO: assert that there is no auxiliary latent variable in the guide
-        model_kwargs = model_kwargs.copy()
-        prototype_trace = trace(seed(model, rng_key)).get_trace(*model_args, **model_kwargs)
-        subsample_plate_sizes = {
-            name: site["args"]
-            for name, site in prototype_trace.items()
-            if site["type"] == "plate" and site["args"][0] > site["args"][1]  # i.e. size > subsample_size
-        }
 
-        pos_key, guide_key, rng_key = random.split(rng_key, 3)
         guide_with_params = substitute(guide, guide_params)
 
         # factor out?
@@ -920,43 +923,17 @@ def variational_proxy(guide, guide_params, num_particles=10):
                                 site["fn"].log_prob(site["value"]), frame.dim)
             return log_lik
 
-        def log_variational(params):
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', category=UserWarning)
-                dummy_subsample = {k: jnp.array([], dtype=jnp.int32) for k in subsample_plate_sizes}
-                with block(), substitute(data=dummy_subsample):
-                    posterior_prob, _ = log_density(guide_with_params, model_args, model_kwargs, params)
-            return posterior_prob
-
-        def log_prior(params):
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', category=UserWarning)
-                dummy_subsample = {k: jnp.array([], dtype=jnp.int32) for k in subsample_plate_sizes}
-                with block(), substitute(data=dummy_subsample):
-                    prior_prob, _ = log_density(model, model_kwargs, params)
-            return prior_prob
-
         return_sites = [k for k, site in prototype_trace.items()
                         if site["type"] == "sample" and not site["is_observed"]]
-        posterior_samples = _predictive(pos_key, guide_with_params, {}, (num_particles,), return_sites=return_sites,
+        posterior_samples = _predictive(rng_key, guide_with_params, {}, (num_particles,), return_sites=return_sites,
                                         parallel=True, model_args=model_args, model_kwargs=model_kwargs)
 
         log_likelihood_ref = vmap(log_likelihood)(posterior_samples)
-        log_likelihood_ref = {k: v for k, v in log_likelihood_ref.items()}
 
-        log_prior_prob = vmap(log_prior)(posterior_samples)
-        log_var_prob = vmap(log_variational)(posterior_samples)
-
-        exp_likelihood = {name: jnp.exp(log_var_prob) * log_like / num_particles
-                          for name, log_like in log_likelihood_ref.items()}
-        # w_i = E_{z~Q}[l(x_i,z)] / sum_j(E_{z~Q}[l(x_j,z)])
-        weights = {name: exp_likelihood[name] / exp_likelihood[name].sum()
+        weights = {name: (log_like / log_like.sum(-1).reshape((-1, 1))).mean(0)
                    for name, log_like in log_likelihood_ref.items()}
 
-        # ELBO E_{z~Q}[l(z) + log(pi(z)) - log(q(z))]
-        elbo = {name: exp_likelihood[name].sum() +  # TODO: use ELBO implementation from NumPyro
-                      (jnp.exp(log_var_prob) / num_particles * (log_prior_prob - log_var_prob)).sum() for name in
-                log_likelihood_ref.keys()}
+        log_likelihood_ref_sum = {name: log_like.sum(1).mean() for name, log_like in log_likelihood_ref.items()}
 
         def gibbs_init(rng_key, gibbs_sites):
             return VariationalProxyState(
@@ -977,17 +954,14 @@ def variational_proxy(guide, guide_params, num_particles=10):
             return u_new, gibbs_state
 
         def proxy_fn(params, subsample_lik_sites, gibbs_state):
-
             proxy_sum = {}
             proxy_subsample = {}
             # TODO: convert params to constrained space
-            log_prior_prob = log_prior(params)
-            log_posterior_prob = log_variational(params)
 
             for name in subsample_lik_sites:
-                # Q(z) = L(z)pi(z)/p(x) => L(z) = p(x)/Q(z)pi(z) >= exp(elbo)/Q(z)pi(z) =>
-                # log(L(z)) = elbo - Q(z) - pi(z)
-                proxy_sum[name] = elbo[name] - log_posterior_prob - log_prior_prob
+                # Q(z) = L(z)pi(z)/p(x) => L(z) = p(x)/Q(z)pi(z) >= exp(-elbo)/Q(z)pi(z) =>
+                # log(L(z)) = Q(z) - pi(z) - elbo
+                proxy_sum[name] = log_likelihood_ref_sum[name] # log_var_prob - log_prior_prob - evidence[name]
 
                 # w_i = exp(E_{z~Q}[l(w_i, z)]) / sum_j^n exp(E_{z~Q}[l(w_j, z)])
                 proxy_subsample[name] = gibbs_state.subsample_weights[name] * proxy_sum[name]

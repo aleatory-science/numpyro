@@ -155,7 +155,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--inner_kernel", type=str, choices=["nuts", "hmc"], default="nuts"
     )
-    parser.add_argument("--device", default="cpu", type=str, choices=["cpu", "gpu"])
+    parser.add_argument("--device", default="gpu", type=str, choices=["cpu", "gpu"])
     parser.add_argument(
         "--rng_seed", default=37, type=int, help="random number generator seed"
     )
