@@ -176,7 +176,7 @@ def run_hmc(model, data, num_mix_comp, num_samples, bvm_init_locs):
         model,
         init_strategy=init_to_value(values=bvm_init_locs),
         dense_mass=True,
-        max_tree_depth=5,
+        max_tree_depth=7,
     )
     mcmc = MCMC(kernel, num_samples=num_samples, num_warmup=num_samples // 5)
     mcmc.run(rng_key, data, len(data), num_mix_comp)
