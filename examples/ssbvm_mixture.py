@@ -1,3 +1,4 @@
+import math
 import pickle
 import sys
 import warnings
@@ -5,9 +6,12 @@ from math import pi
 from pathlib import Path
 
 import matplotlib.colors
+import matplotlib.pyplot as plt
 import numpy as np
 from jax import numpy as jnp
 from jax import random
+from sklearn.cluster import KMeans
+
 import numpyro
 from numpyro.contrib.funsor import config_enumerate
 from numpyro.distributions import (
@@ -17,15 +21,10 @@ from numpyro.distributions import (
     VonMises,
     Beta,
     Categorical,
-    Sine,
     SineSkewed,
-    HalfNormal,
+    SineBivariateVonMises,
 )
-from numpyro.infer import NUTS, MCMC, init_to_value, Predictive, init_to_median
-import matplotlib.pyplot as plt
-
-from sklearn.cluster import KMeans
-import math
+from numpyro.infer import NUTS, MCMC, init_to_value, Predictive
 
 np.set_printoptions(threshold=sys.maxsize)
 
@@ -84,44 +83,6 @@ def multiple_formatter(denominator=2, number=np.pi, latex="\pi"):
     return _multiple_formatter
 
 
-@config_enumerate
-def sine_model(data, num_data, num_mix_comp=2):
-    # Mixture prior
-    mix_weights = numpyro.sample("mix_weights", Dirichlet(jnp.ones((num_mix_comp,))))
-
-    # Hprior BvM
-    # Bayesian Inference and Decision Theory by Kathryn Blackmond Laskey
-    beta_mean_phi = numpyro.sample("beta_mean_phi", Uniform(0.0, 1.0))
-    beta_prec_phi = numpyro.sample("beta_prec_phi", Gamma(1.0, 1 / 20.0))  # shape, rate
-    halpha_phi = beta_mean_phi * beta_prec_phi
-    beta_mean_psi = numpyro.sample("beta_mean_psi", Uniform(0, 1.0))
-    beta_prec_psi = numpyro.sample("beta_prec_psi", Gamma(1.0, 1 / 20.0))  # shape, rate
-    halpha_psi = beta_mean_psi * beta_prec_psi
-
-    with numpyro.plate("mixture", num_mix_comp):
-        # BvM priors
-        phi_loc = numpyro.sample("phi_loc", VonMises(pi, 2.0))
-        psi_loc = numpyro.sample("psi_loc", VonMises(0.0, 0.1))
-        phi_conc = numpyro.sample(
-            "phi_conc", Beta(halpha_phi, beta_prec_phi - halpha_phi)
-        )
-        psi_conc = numpyro.sample(
-            "psi_conc", Beta(halpha_psi, beta_prec_psi - halpha_psi)
-        )
-        corr_scale = numpyro.sample("corr_scale", Beta(2.0, 10.0))
-
-    with numpyro.plate("obs_plate", num_data, dim=-1):
-        assign = numpyro.sample(
-            "mix_comp", Categorical(mix_weights), infer={"enumerate": "parallel"}
-        )
-        sine = Sine(
-            phi_loc=phi_loc[assign],
-            psi_loc=psi_loc[assign],
-            phi_concentration=1000 * phi_conc[assign],
-            psi_concentration=1000 * psi_conc[assign],
-            weighted_correlation=corr_scale[assign],
-        )
-        return numpyro.sample("phi_psi", sine, obs=data)
 
 
 @config_enumerate
@@ -160,7 +121,7 @@ def ss_model(data, num_data, num_mix_comp=2):
         assign = numpyro.sample(
             "mix_comp", Categorical(mix_weights), infer={"enumerate": "parallel"}
         )
-        sine = Sine(
+        sine = SineBivariateVonMises(
             phi_loc=phi_loc[assign],
             psi_loc=psi_loc[assign],
             phi_concentration=1000 * phi_conc[assign],
@@ -175,10 +136,10 @@ def run_hmc(model, data, num_mix_comp, num_samples, bvm_init_locs):
     kernel = NUTS(
         model,
         init_strategy=init_to_value(values=bvm_init_locs),
-        dense_mass=True,
         max_tree_depth=7,
+        step_size=2.31e-3,
     )
-    mcmc = MCMC(kernel, num_samples=num_samples, num_warmup=num_samples // 5)
+    mcmc = MCMC(kernel, num_samples=num_samples, num_warmup=80)
     mcmc.run(rng_key, data, len(data), num_mix_comp)
     mcmc.print_summary()
     post_samples = mcmc.get_samples()
@@ -197,8 +158,8 @@ def fetch_aa_dihedrals(split="train", subsample_to=1000_000, reuse_shuffles=True
     else:
         shuffles = {
             k: np.random.permutation(np.arange(v.shape[0]))[
-                : min(subsample_to, v.shape[0])
-            ]
+               : min(subsample_to, v.shape[0])
+               ]
             for k, v in data.items()
         }
         pickle.dump(shuffles, shuffle_file.open("wb"))
@@ -291,29 +252,29 @@ def show_center(data, aa, means, num_comp, file_name="kde_rama_pred.png"):
 
 
 def main(
-    num_samples=1_000,
-    aas=("S", "G", "P"),
-    capture_std=True,
-    rerun_inference=True,
-    reuse_shuffles=True,
+        num_samples=1600,
+        aas=("S",),
+        capture_std=True,
+        rerun_inference=True,
+        reuse_shuffles=True,
 ):
-    data = fetch_aa_dihedrals(subsample_to=25_000, reuse_shuffles=reuse_shuffles)
-    num_mix_comps = {"S": 9, "G": 10, "P": 7}
+    data = fetch_aa_dihedrals(subsample_to=15_000, reuse_shuffles=reuse_shuffles)
+    num_mix_comps = {"S": 5, "G": 4, "P": 3}
     pred_datas = {}
     rng_key = random.PRNGKey(123)
     for aa in aas:
         num_mix_comp = num_mix_comps[aa]
         if capture_std:
             sys.stdout = (
-                Path(__file__).parent
-                / "runs"
-                / f"ssbvm_bmixture_aa{aa}_comp{num_mix_comp}_steps{num_samples}.out"
+                    Path(__file__).parent
+                    / "runs"
+                    / f"ssbvm_bmixture_aa{aa}_comp{num_mix_comp}_steps{num_samples}.out"
             ).open("w")
 
         chain_file = (
-            Path(__file__).parent
-            / "runs"
-            / f"ssbvm_bmixture_aa{aa}_comp{num_mix_comp}_steps{num_samples}.pkl"
+                Path(__file__).parent
+                / "runs"
+                / f"ssbvm_bmixture_aa{aa}_comp{num_mix_comp}_steps{num_samples}.pkl"
         )
 
         kmeans = KMeans(num_mix_comp)

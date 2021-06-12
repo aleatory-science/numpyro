@@ -40,7 +40,7 @@ from numpyro.distributions.continuous import (
 from numpyro.distributions.directional import (
     ProjectedNormal,
     VonMises,
-    Sine,
+    SineBivariateVonMises,
     SineSkewed,
 )
 from numpyro.distributions.discrete import (
