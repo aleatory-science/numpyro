@@ -20,11 +20,10 @@ is applicable when the likelihood factorizes as a product of N terms.
 import argparse
 import time
 
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-
 from jax import random
-import jax.numpy as jnp
 
 import numpyro
 import numpyro.distributions as dist
@@ -46,19 +45,14 @@ def model(data, obs, subsample_size):
 def run_hmcecs(hmcecs_key, args, data, obs, inner_kernel):
     svi_key, mcmc_key = random.split(hmcecs_key)
 
-    # find reference parameters for second order taylor expansion to estimate likelihood (taylor_proxy)
     optimizer = numpyro.optim.Adam(step_size=1e-3)
-    guide = autoguide.AutoDelta(model)
+    guide = autoguide.AutoNormal(model)
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
     params, losses = svi.run(
         svi_key, args.num_svi_steps, data, obs, args.subsample_size
     )
-    ref_params = {"theta": params["theta_auto_loc"]}
 
-    # taylor proxy estimates log likelihood (ll) by
-    # taylor_expansion(ll, theta_curr) +
-    #     sum_{i in subsample} ll_i(theta_curr) - taylor_expansion(ll_i, theta_curr) around ref_params
-    proxy = HMCECS.taylor_proxy(ref_params)
+    proxy = HMCECS.variational_proxy(guide, params, svi.constrain_fn)
 
     kernel = HMCECS(inner_kernel, num_blocks=args.num_blocks, proxy=proxy)
     mcmc = MCMC(kernel, num_warmup=args.num_warmup, num_samples=args.num_samples)
@@ -77,7 +71,7 @@ def run_hmc(mcmc_key, args, data, obs, kernel):
 
 def main(args):
     assert (
-        11_000_000 >= args.num_datapoints
+            11_000_000 >= args.num_datapoints
     ), "11,000,000 data points in the Higgs dataset"
     # full dataset takes hours for plain hmc!
     if args.dataset == "higgs":
@@ -144,11 +138,11 @@ if __name__ == "__main__":
         "Hamiltonian Monte Carlo with Energy Conserving Subsampling"
     )
     parser.add_argument("--subsample_size", type=int, default=1300)
-    parser.add_argument("--num_svi_steps", type=int, default=5000)
+    parser.add_argument("--num_svi_steps", type=int, default=10_000)
     parser.add_argument("--num_blocks", type=int, default=100)
     parser.add_argument("--num_warmup", type=int, default=500)
-    parser.add_argument("--num_samples", type=int, default=500)
-    parser.add_argument("--num_datapoints", type=int, default=1_500_000)
+    parser.add_argument("--num_samples", type=int, default=1500)
+    parser.add_argument("--num_datapoints", type=int, default=500_000)
     parser.add_argument(
         "--dataset", type=str, choices=["higgs", "mock"], default="higgs"
     )

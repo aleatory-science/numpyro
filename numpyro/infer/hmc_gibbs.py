@@ -16,7 +16,7 @@ from numpyro.distributions.transforms import biject_to
 from numpyro.handlers import block, condition, seed, substitute, trace
 from numpyro.infer.hmc import HMC
 from numpyro.infer.mcmc import MCMCKernel
-from numpyro.infer.util import _predictive, _unconstrain_reparam, log_density
+from numpyro.infer.util import _predictive, _unconstrain_reparam
 from numpyro.util import cond, fori_loop, identity, ravel_pytree
 
 HMCGibbsState = namedtuple("HMCGibbsState", "z, hmc_state, rng_key")
@@ -694,8 +694,8 @@ class HMCECS(HMCGibbs):
         return taylor_proxy(reference_params)
 
     @staticmethod
-    def variational_proxy(guide, guide_params, num_particles=10):
-        return variational_proxy(guide, guide_params, num_particles)
+    def variational_proxy(guide, guide_params, constrain_fn, num_particles=10):
+        return variational_proxy(guide, guide_params, constrain_fn, num_particles)
 
 
 def perturbed_method(subsample_plate_sizes, proxy_fn):
@@ -888,7 +888,7 @@ def taylor_proxy(reference_params):
     return construct_proxy_fn
 
 
-def variational_proxy(guide, guide_params, num_particles=10):
+def variational_proxy(guide, guide_params, constrain_fn, num_particles=10):
     def construct_proxy_fn(
             rng_key,
             prototype_trace,
@@ -929,42 +929,48 @@ def variational_proxy(guide, guide_params, num_particles=10):
                                         parallel=True, model_args=model_args, model_kwargs=model_kwargs)
 
         log_likelihood_ref = vmap(log_likelihood)(posterior_samples)
+        log_likelihood_ref_sum = {name: log_like.sum(1) for name, log_like in log_likelihood_ref.items()}
+        log_likelihood_ref_mean = {name: log_like.mean() for name, log_like in log_likelihood_ref_sum.items()}
 
-        weights = {name: (log_like / log_like.sum(-1).reshape((-1, 1))).mean(0)
-                   for name, log_like in log_likelihood_ref.items()}
+        def distance(x, y):
+            x_flat, _ = ravel_pytree(x)
+            y_flat, _ = ravel_pytree(y)
+            return jnp.exp(-jnp.mean(jnp.square(x_flat - y_flat)) * 10)  # TODO: control variance
 
-        log_likelihood_ref_sum = {name: log_like.sum(1).mean() for name, log_like in log_likelihood_ref.items()}
+        def get_weights(params, subsample_log_liks):
+            coefs = vmap(partial(distance, params))(posterior_samples)
+            weights = {}
+            for name, log_lik in subsample_log_liks.items():
+                weights[name] = jnp.dot(coefs, log_lik) / jnp.dot(coefs, log_likelihood_ref_sum[name])
+            return weights
 
         def gibbs_init(rng_key, gibbs_sites):
             return VariationalProxyState(
-                {name: weights[name][subsample_idx] for name, subsample_idx in gibbs_sites.items()})
+                {name: log_likelihood_ref[name][:, subsample_idx] for name, subsample_idx in gibbs_sites.items()})
 
         def gibbs_update(rng_key, gibbs_sites, gibbs_state):
             u_new, pads, new_idxs, starts = _block_update_proxy(num_blocks, rng_key, gibbs_sites, subsample_plate_sizes)
 
-            new_subsample_weights = {}
-            for name, subsample_weights in gibbs_state.subsample_weights.items():
-                size, subsample_size = subsample_plate_sizes[name]  # TODO: fix duplication!
-                pad, new_idx, start = pads[name], new_idxs[name], starts[name]
-                new_value = jnp.pad(subsample_weights,
-                                    [(0, pad)] + [(0, 0)] * (jnp.ndim(subsample_weights) - 1))
-                new_value = lax.dynamic_update_slice_in_dim(new_value, weights[name][new_idx], start, 0)
-                new_subsample_weights[name] = new_value[:subsample_size]
+            new_subsample_weights = {name: log_likelihood_ref[name][:, u_new[name]] for name, subsample_weights in
+                                     gibbs_state.subsample_weights.items()}
+
             gibbs_state = VariationalProxyState(new_subsample_weights)
             return u_new, gibbs_state
 
         def proxy_fn(params, subsample_lik_sites, gibbs_state):
             proxy_sum = {}
             proxy_subsample = {}
+
             # TODO: convert params to constrained space
+            weights = get_weights(constrain_fn(params), gibbs_state.subsample_weights)
 
             for name in subsample_lik_sites:
                 # Q(z) = L(z)pi(z)/p(x) => L(z) = p(x)/Q(z)pi(z) >= exp(-elbo)/Q(z)pi(z) =>
                 # log(L(z)) = Q(z) - pi(z) - elbo
-                proxy_sum[name] = log_likelihood_ref_sum[name] # log_var_prob - log_prior_prob - evidence[name]
+                proxy_sum[name] = log_likelihood_ref_mean[name]  # log_var_prob - log_prior_prob - evidence[name]
 
                 # w_i = exp(E_{z~Q}[l(w_i, z)]) / sum_j^n exp(E_{z~Q}[l(w_j, z)])
-                proxy_subsample[name] = gibbs_state.subsample_weights[name] * proxy_sum[name]
+                proxy_subsample[name] = weights[name] * proxy_sum[name]
             return proxy_sum, proxy_subsample
 
         return proxy_fn, gibbs_init, gibbs_update
