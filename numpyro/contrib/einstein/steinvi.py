@@ -216,6 +216,13 @@ class SteinVI:
 
         return vmap(local_trace)(random.split(particle_seed, self.num_stein_particles))
 
+    def _compute_attractive(self):
+        pass
+    
+    def _compute_repulsive(self):
+        pass
+
+
     def _svgd_loss_and_grads(self, rng_key, unconstr_params, *args, **kwargs):
         # 0. Separate model and guide parameters, since only guide parameters are updated using Stein
         non_mixture_uparams = (
@@ -239,7 +246,7 @@ class SteinVI:
         )
         attractive_key, classic_key = random.split(rng_key)
 
-        # 2. Calculate gradients for each particle
+        # 2. Calculate score \nabla_{x_i} E_z~q(z|x_i)
         def kernel_particles_loss_fn(
             rng_key, particles
         ):  # TODO: rewrite using def to utilize jax caching
@@ -317,6 +324,7 @@ class SteinVI:
                 axis=0,
             )
         )(tstein_particles)
+
         repulsive_force = vmap(
             lambda y: jnp.sum(
                 vmap(
