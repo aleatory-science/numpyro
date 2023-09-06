@@ -215,64 +215,67 @@ class SteinVI:
             return init_params
 
         return vmap(local_trace)(random.split(particle_seed, self.num_stein_particles))
-
-    def _compute_attractive(self, rng_key, ps, tps, ctps, pinfos, unravel_fn, uparams,*args, **kwargs):
-
-        # Calculate VI score \nabla_{x_i} E_z~q(z|x_i)[ log { p(D, z) / (\sum_j q(z|x_j)) } ] -- better name?
-        # by MCI. 
-        def vi_score(
-            rng_key, particles
-        ):  # TODO: rewrite using def to utilize jax caching
-            particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
-            grads = vmap(
-                lambda i: grad( # TODO: can we detect when we can move this gradient in?
-                    lambda particle: (
-                        vmap(
-                            lambda elbo_key: self.stein_loss.single_particle_loss(
-                                rng_key=elbo_key,
-                                model=handlers.scale(
-                                    self._inference_model, self.loss_temperature
-                                ),
-                                guide=self.guide,
-                                selected_particle=unravel_fn(particle),
-                                unravel_pytree=unravel_fn,
-                                flat_particles=particles,
-                                select_index=i,
-                                model_args=args,
-                                model_kwargs=kwargs,
-                                param_map=self.constrain_fn(uparams),
-                            )
-                        )(
-                            random.split(
-                                particle_keys[i], self.stein_loss.elbo_num_particles
-                            )
+    
+    def _vi_score_fn(self, rng_key, ps, uparams, unravel_fn, args, kwargs):  
+        """ Calculate VI score \nabla_{x_i} E_z~q(z|x_i)[ log { p(D, z) / (\sum_j q(z|x_j)) } ] -- TODO: better name? 
+            by MCI. """
+        # TODO: rewrite using def to utilize jax caching
+        particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
+        grads = vmap(
+            lambda i: grad( # TODO: can we detect when we can move this gradient in?
+                lambda particle: (
+                    vmap(
+                        lambda elbo_key: self.stein_loss.single_particle_loss(
+                            rng_key=elbo_key,
+                            model=handlers.scale(
+                                self._inference_model, self.loss_temperature
+                            ),
+                            guide=self.guide,
+                            selected_particle=unravel_fn(particle),
+                            unravel_pytree=unravel_fn,
+                            flat_particles=ps,
+                            select_index=i,
+                            model_args=args,
+                            model_kwargs=kwargs,
+                            param_map=self.constrain_fn(uparams),
                         )
-                    ).mean()
-                )(particles[i])
-            )(jnp.arange(self.stein_loss.stein_num_particles))
+                    )(
+                        random.split(
+                            particle_keys[i], self.stein_loss.elbo_num_particles
+                        )
+                    )
+                ).mean()
+            )(ps[i])
+        )(jnp.arange(self.stein_loss.stein_num_particles))
 
-            return grads
+        return grads
+
+    def _compute_attractive(self, rng_key, ps, tps, ctps, pinfos, unravel_fn, uparams, *args, **kwargs):
 
         # 2.2 Compute particle gradients (for attractive force)
-        particle_ljp_grads = vi_score(rng_key, ctps)
+        ps_loss_grads = self._vi_score_fn(rng_key, ctps, uparams, unravel_fn, args, kwargs)
 
+        kernel = self.kernel_fn.compute(  # TODO: check the computation cost of this
+            ps, pinfos, self._vi_score_fn
+        )
 
         # 4. Calculate the attractive force and repulsive force on the particles
         force = vmap(
             lambda y: jnp.sum(
                 vmap(
                     lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad)
-                )(tps, particle_ljp_grads),
+                )(tps, ps_loss_grads),
                 axis=0,
             )
         )(tps)
+
         return force
     
-    def _compute_repulsive(self, ps, tps, pinfos, vi_score):
+    def _compute_repulsive(self, ps, tps, pinfos):
+        """ Calculate kernel of particles """
+        kernel = self.kernel_fn.compute(  # TODO: check the computation cost of this
 
-        # 3. Calculate kernel of particles
-        kernel = self.kernel_fn.compute(
-            ps, pinfos, vi_score
+            ps, pinfos, self._vi_score_fn
         )
 
         force = vmap(
@@ -286,8 +289,7 @@ class SteinVI:
         )(tps)
         return force
 
-
-    def _svgd_loss_and_grads(self, rng_key, unconstr_params, *args, **kwargs): 
+    def _loss_and_grads(self, rng_key, unconstr_params, *args, **kwargs): 
 
         # 0. Separate model and guide parameters, since only guide parameters are updated using Stein
         #    TODO: extend to https://arxiv.org/abs/1704.05155
@@ -303,6 +305,7 @@ class SteinVI:
         stein_uparams = {
             p: v for p, v in unconstr_params.items() if p not in uparams
         }
+
 
         # 1. Collect each guide parameter into monolithic particles that capture correlations
         # between parameter values across each individual particle
@@ -330,7 +333,7 @@ class SteinVI:
         )
 
         # 2.2 Compute non-mixture parameter gradients
-        non_mixture_param_grads = grad(
+        non_mixture_param_grads = grad(  # TODO: is this the correct way to handle non-particles?
             lambda cps: -self.stein_loss.loss(
                 classic_key,
                 self.constrain_fn(cps),
@@ -343,11 +346,9 @@ class SteinVI:
         )(uparams)
 
         attr_force = self._compute_attractive(attr_key, ps, tps, ctps, pinfos, unravel_fn, uparams,*args, **kwargs)
-        repr_force = self._compute_repulsive()
+        repr_force = self._compute_repulsive(ps, tps, pinfos)
 
-
-
-        def single_particle_grad(particle, attr_forces, rep_forces): 
+        def single_particle_grad(particle, attr_forces, rep_forces): # TODO: justify this!
             def _nontrivial_jac(var_name, var):
                 if isinstance(self.particle_transforms[var_name], IdentityTransform):
                     return None
@@ -498,7 +499,7 @@ class SteinVI:
         rng_key, rng_key_mcmc, rng_key_step = random.split(state.rng_key, num=3)
         params = self.optim.get_params(state.optim_state)
         optim_state = state.optim_state
-        loss_val, grads = self._svgd_loss_and_grads(
+        loss_val, grads = self._loss_and_grads(
             rng_key_step, params, *args, **kwargs, **self.static_kwargs
         )
         optim_state = self.optim.update(grads, optim_state)
@@ -550,7 +551,7 @@ class SteinVI:
         # we split to have the same seed as `update_fn` given a state
         _, _, rng_key_eval = random.split(state.rng_key, num=3)
         params = self.optim.get_params(state.optim_state)
-        normed_stein_force, _ = self._svgd_loss_and_grads(
+        normed_stein_force, _ = self._loss_and_grads(
             rng_key_eval, params, *args, **kwargs, **self.static_kwargs
         )
         return normed_stein_force
