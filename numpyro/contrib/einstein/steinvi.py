@@ -156,13 +156,16 @@ class SteinVI:
         self.particle_transform_fn = None
         self.particle_transforms = None
 
+    # TODO: these should be the kernel interface
     def _apply_kernel(self, kernel, x, y, v):
+        # TODO: this switch seems unnecessary
         if self.kernel_fn.mode == "norm" or self.kernel_fn.mode == "vector":
             return kernel(x, y) * v
         else:
             return kernel(x, y) @ v
 
     def _kernel_grad(self, kernel, x, y):
+        # TODO: this should be a function of the kernel
         if self.kernel_fn.mode == "norm":
             return grad(lambda x: kernel(x, y))(x)
         elif self.kernel_fn.mode == "vector":
@@ -250,7 +253,8 @@ class SteinVI:
 
         return grads
 
-    def _compute_attractive(self, rng_key, ps, tps, ctps, pinfos, unravel_fn, uparams, *args, **kwargs):
+    def _compute_attractive(self, rng_key, ps, pinfos, unravel_fn, uparams, *args, **kwargs):
+        ps, tps, ctps = self.transform_particles(ps, unravel_fn)
 
         # 2.2 Compute particle gradients (for attractive force)
         ps_loss_grads = self._vi_score_fn(rng_key, ctps, uparams, unravel_fn, args, kwargs)
@@ -271,8 +275,10 @@ class SteinVI:
 
         return force
     
-    def _compute_repulsive(self, ps, tps, pinfos):
+    def _compute_repulsive(self, ps, pinfos):
         """ Calculate kernel of particles """
+        ps, tps, ctps = self.transform_particles(ps, unravel_fn)
+
         kernel = self.kernel_fn.compute(  # TODO: check the computation cost of this
 
             ps, pinfos, self._vi_score_fn
@@ -288,19 +294,42 @@ class SteinVI:
             )
         )(tps)
         return force
+    
+    def transform_particles(ps, unravel_fn):
+        def transform(p):
+            params = unravel_fn(p)
+            tparams = self.particle_transform_fn(params)
+            ctparams = self.constrain_fn(tparams)
+            tp, _ = ravel_pytree(tparams)
+            ctp, _ = ravel_pytree(ctparams)
+            return p, tp, ctp
+        return ps, tps, ctps
+    
+    def _grad_params(self, rng_key, ps, args, kwargs):
+        ps, tps, ctps = self.transform_particles(ps, unravel_fn)
+
+        non_mixture_param_grads = grad(  # TODO: is this the correct way to handle non-particles?
+            lambda cps: -self.stein_loss.loss(
+                rng_key,
+                self.constrain_fn(cps),
+                handlers.scale(self._inference_model, self.loss_temperature),
+                self.guide,
+                batch_unravel_fn(ctps),
+                *args,
+                **kwargs,
+            )
+        )(uparams)
+        return non_mixture_param_grads
 
     def _loss_and_grads(self, rng_key, unconstr_params, *args, **kwargs): 
-
-        # 0. Separate model and guide parameters, since only guide parameters are updated using Stein
         #    TODO: extend to https://arxiv.org/abs/1704.05155
 
-        uparams = (
-            {  # Includes any marked guide parameters and all model parameters
+        # 0. Separate model and guide parameters, since only guide parameters are updated using Stein
+        uparams = {  # Includes any marked guide parameters and all model parameters
                 p: v
                 for p, v in unconstr_params.items()
                 if p not in self.guide_sites or self.non_mixture_params_fn(p)
             }
-        )
 
         stein_uparams = {
             p: v for p, v in unconstr_params.items() if p not in uparams
@@ -317,36 +346,11 @@ class SteinVI:
         )
         attr_key, classic_key = random.split(rng_key)
 
-
-        def particle_transform_fn(particle):
-            params = unravel_fn(particle)
-
-            tparams = self.particle_transform_fn(params)
-            ctparams = self.constrain_fn(tparams)
-            tparticle, _ = ravel_pytree(tparams)
-            ctparticle, _ = ravel_pytree(ctparams)
-            return tparticle, ctparticle
-
-        # 2.1 Lift particles to constraint space
-        tps, ctps = vmap(particle_transform_fn)(
-            ps
-        )
-
         # 2.2 Compute non-mixture parameter gradients
-        non_mixture_param_grads = grad(  # TODO: is this the correct way to handle non-particles?
-            lambda cps: -self.stein_loss.loss(
-                classic_key,
-                self.constrain_fn(cps),
-                handlers.scale(self._inference_model, self.loss_temperature),
-                self.guide,
-                batch_unravel_fn(ctps),
-                *args,
-                **kwargs,
-            )
-        )(uparams)
+        non_mixture_param_grads = _grad_params(self, rng_key, ps, args, kwargs)
 
-        attr_force = self._compute_attractive(attr_key, ps, tps, ctps, pinfos, unravel_fn, uparams,*args, **kwargs)
-        repr_force = self._compute_repulsive(ps, tps, pinfos)
+        attr_force = self._compute_attractive(attr_key, ps, pinfos, unravel_fn, uparams,*args, **kwargs)
+        repr_force = self._compute_repulsive(ps, pinfos)
 
         def single_particle_grad(particle, attr_forces, rep_forces): # TODO: justify this!
             def _nontrivial_jac(var_name, var):
