@@ -218,14 +218,14 @@ class SteinVI:
             return init_params
 
         return vmap(local_trace)(random.split(particle_seed, self.num_stein_particles))
-    
-    def _vi_score_fn(self, rng_key, ps, uparams, unravel_fn, args, kwargs):  
-        """ Calculate VI score \nabla_{x_i} E_z~q(z|x_i)[ log { p(D, z) / (\sum_j q(z|x_j)) } ] -- TODO: better name? 
-            by MCI. """
+
+    def _vi_score_fn(self, rng_key, ps, uparams, unravel_fn, args, kwargs):
+        """Calculate VI score \nabla_{x_i} E_z~q(z|x_i)[ log { p(D, z) / (\sum_j q(z|x_j)) } ] -- TODO: better name?
+        by MCI."""
         # TODO: rewrite using def to utilize jax caching
         particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
         grads = vmap(
-            lambda i: grad( # TODO: can we detect when we can move this gradient in?
+            lambda i: grad(  # TODO: can we detect when we can move this gradient in?
                 lambda particle: (
                     vmap(
                         lambda elbo_key: self.stein_loss.single_particle_loss(
@@ -253,11 +253,15 @@ class SteinVI:
 
         return grads
 
-    def _compute_attractive(self, rng_key, ps, pinfos, unravel_fn, uparams, *args, **kwargs):
+    def _compute_attractive(
+        self, rng_key, ps, pinfos, unravel_fn, uparams, model_args, model_kwargs
+    ):
         ps, tps, ctps = self.transform_particles(ps, unravel_fn)
 
         # 2.2 Compute particle gradients (for attractive force)
-        ps_loss_grads = self._vi_score_fn(rng_key, ctps, uparams, unravel_fn, args, kwargs)
+        ps_loss_grads = self._vi_score_fn(
+            rng_key, ctps, uparams, unravel_fn, model_args, model_kwargs
+        )
 
         kernel = self.kernel_fn.compute(  # TODO: check the computation cost of this
             ps, pinfos, self._vi_score_fn
@@ -274,13 +278,12 @@ class SteinVI:
         )(tps)
 
         return force
-    
+
     def _compute_repulsive(self, ps, pinfos, unravel_fn):
-        """ Calculate kernel of particles """
+        """Calculate kernel of particles"""
         ps, tps, _ = self.transform_particles(ps, unravel_fn)
 
         kernel = self.kernel_fn.compute(  # TODO: check the computation cost of this
-
             ps, pinfos, self._vi_score_fn
         )
 
@@ -294,7 +297,7 @@ class SteinVI:
             )
         )(tps)
         return force
-    
+
     def transform_particles(self, ps, unravel_fn):
         def transform(p):
             params = unravel_fn(p)
@@ -303,97 +306,115 @@ class SteinVI:
             tp, _ = ravel_pytree(tparams)
             ctp, _ = ravel_pytree(ctparams)
             return p, tp, ctp
-        
+
         return vmap(transform)(ps)
-    
-    def _grad_params(self, rng_key, ps, uparams, unravel_fn, batch_unravel_fn, model_args, model_kwargs):
+
+    def _grad_params(
+        self,
+        rng_key,
+        ps,
+        uparams,
+        unravel_fn,
+        batch_unravel_fn,
+        model_args,
+        model_kwargs,
+    ):
         ps, _, ctps = self.transform_particles(ps, unravel_fn)
 
-        non_mixture_param_grads = grad(  # TODO: is this the correct way to handle non-particles?
-            lambda cps: -self.stein_loss.loss(
-                rng_key,
-                self.constrain_fn(cps),
-                handlers.scale(self._inference_model, self.loss_temperature),
-                self.guide,
-                batch_unravel_fn(ctps),
-                *model_args,
-                **model_kwargs,
-            )
-        )(uparams)
+        non_mixture_param_grads = (
+            grad(  # TODO: is this the correct way to handle non-particles?
+                lambda cps: -self.stein_loss.loss(
+                    rng_key,
+                    self.constrain_fn(cps),
+                    handlers.scale(self._inference_model, self.loss_temperature),
+                    self.guide,
+                    batch_unravel_fn(ctps),
+                    *model_args,
+                    **model_kwargs,
+                )
+            )(uparams)
+        )
         return non_mixture_param_grads
 
-    def _loss_and_grads(self, rng_key, unconstr_params, *args, **kwargs): 
+    def _compute_stein_force(self, p, attr, rep, unravel_fn):
+        """Compute Stein force on particle accounting for any parameter transforms"""
+
+        def _nontrivial_jac(var_name, var):
+            if isinstance(self.particle_transforms[var_name], IdentityTransform):
+                return None
+            return jacfwd(self.particle_transforms[var_name].inv)(var)
+
+        def _update_force(af, rf, jac):
+            force = af.reshape(-1) + rf.reshape(-1)
+            if jac is not None:
+                force = force @ jac.reshape(
+                    (_numel(jac.shape[: len(jac.shape) // 2]), -1)
+                )
+            return force.reshape(af.shape)
+
+        reparam_jac = {
+            name: tree_map(lambda var: _nontrivial_jac(name, var), variables)
+            for name, variables in unravel_fn(p).items()
+        }
+
+        jac_params = tree_map(
+            _update_force,
+            unravel_fn(attr),
+            unravel_fn(rep),
+            reparam_jac,
+        )
+        jac_particle, _ = ravel_pytree(jac_params)
+        return jac_particle
+
+    def _loss_and_grads(self, rng_key, unconstr_params, *args, **kwargs):
         #    TODO: extend to https://arxiv.org/abs/1704.05155
 
         # 0. Separate model and guide parameters, since only guide parameters are updated using Stein
         uparams = {  # Includes any marked guide parameters and all model parameters
-                p: v
-                for p, v in unconstr_params.items()
-                if p not in self.guide_sites or self.non_mixture_params_fn(p)
-            }
-
-        stein_uparams = {
-            p: v for p, v in unconstr_params.items() if p not in uparams
+            p: v
+            for p, v in unconstr_params.items()
+            if p not in self.guide_sites or self.non_mixture_params_fn(p)
         }
 
+        stein_uparams = {p: v for p, v in unconstr_params.items() if p not in uparams}
 
         # 1. Collect each guide parameter into monolithic particles that capture correlations
         # between parameter values across each individual particle
         ps, unravel_fn, batch_unravel_fn = batch_ravel_pytree(
             stein_uparams, nbatch_dims=1
         )
-        pinfos, _ = self._calc_particle_info(
-            stein_uparams, ps.shape[0]
-        )
+        pinfos, _ = self._calc_particle_info(stein_uparams, ps.shape[0])
         attr_key, classic_key = random.split(rng_key)
 
         # 2. Compute non-particle parameter gradients
-        non_mixture_param_grads = self._grad_params(rng_key=classic_key, 
-                                                    ps=ps, 
-                                                    uparams=uparams, 
-                                                    unravel_fn=unravel_fn, 
-                                                    batch_unravel_fn=batch_unravel_fn, 
-                                                    model_args=args, 
-                                                    model_kwargs=kwargs
-                                                    )
+        non_mixture_param_grads = self._grad_params(
+            rng_key=classic_key,
+            ps=ps,
+            uparams=uparams,
+            unravel_fn=unravel_fn,
+            batch_unravel_fn=batch_unravel_fn,
+            model_args=args,
+            model_kwargs=kwargs,
+        )
 
         # 3. Compute particle gradients
-        attr_force = self._compute_attractive(attr_key, ps, pinfos, unravel_fn, uparams,*args, **kwargs)
-        repr_force = self._compute_repulsive(ps, pinfos, unravel_fn)
-
-        def single_particle_grad(particle, attr_forces, rep_forces): # TODO: justify this!
-            def _nontrivial_jac(var_name, var):
-                if isinstance(self.particle_transforms[var_name], IdentityTransform):
-                    return None
-                return jacfwd(self.particle_transforms[var_name].inv)(var)
-
-            def _update_force(attr_force, rep_force, jac):
-                force = attr_force.reshape(-1) + rep_force.reshape(-1)
-                if jac is not None:
-                    force = force @ jac.reshape(
-                        (_numel(jac.shape[: len(jac.shape) // 2]), -1)
-                    )
-                return force.reshape(attr_force.shape)
-
-            reparam_jac = {
-                name: tree_map(lambda var: _nontrivial_jac(name, var), variables)
-                for name, variables in unravel_fn(particle).items()
-            }
-            jac_params = tree_map(
-                _update_force,
-                unravel_fn(attr_forces),
-                unravel_fn(rep_forces),
-                reparam_jac,
-            )
-            jac_particle, _ = ravel_pytree(jac_params)
-            return jac_particle
+        attr_force = self._compute_attractive(
+            rng_key=attr_key,
+            ps=ps,
+            pinfos=pinfos,
+            unravel_fn=unravel_fn,
+            uparams=uparams,
+            *args,
+            **kwargs,
+        )
+        repr_force = self._compute_repulsive(ps=ps, 
+                                             pinfos=pinfos, 
+                                             unravel_fn=unravel_fn)
 
         particle_grads = (
-            vmap(single_particle_grad)(
-                ps, attr_force, repr_force 
-            )
-            # / self.num_stein_particles  # TODO: why divid here again?
-        )
+            vmap(self._compute_stein_force)(ps, attr_force, repr_force)
+            / self.num_stein_particles
+        )  # TODO: why divid here again? just scales the gradient
 
         # 5. Decompose the monolithic particle forces back to concrete parameter values
         stein_param_grads = batch_unravel_fn(particle_grads)
