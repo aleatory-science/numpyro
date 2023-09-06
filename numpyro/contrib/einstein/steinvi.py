@@ -275,9 +275,9 @@ class SteinVI:
 
         return force
     
-    def _compute_repulsive(self, ps, pinfos):
+    def _compute_repulsive(self, ps, pinfos, unravel_fn):
         """ Calculate kernel of particles """
-        ps, tps, ctps = self.transform_particles(ps, unravel_fn)
+        ps, tps, _ = self.transform_particles(ps, unravel_fn)
 
         kernel = self.kernel_fn.compute(  # TODO: check the computation cost of this
 
@@ -295,7 +295,7 @@ class SteinVI:
         )(tps)
         return force
     
-    def transform_particles(ps, unravel_fn):
+    def transform_particles(self, ps, unravel_fn):
         def transform(p):
             params = unravel_fn(p)
             tparams = self.particle_transform_fn(params)
@@ -303,10 +303,11 @@ class SteinVI:
             tp, _ = ravel_pytree(tparams)
             ctp, _ = ravel_pytree(ctparams)
             return p, tp, ctp
-        return ps, tps, ctps
+        
+        return vmap(transform)(ps)
     
-    def _grad_params(self, rng_key, ps, args, kwargs):
-        ps, tps, ctps = self.transform_particles(ps, unravel_fn)
+    def _grad_params(self, rng_key, ps, uparams, unravel_fn, batch_unravel_fn, model_args, model_kwargs):
+        ps, _, ctps = self.transform_particles(ps, unravel_fn)
 
         non_mixture_param_grads = grad(  # TODO: is this the correct way to handle non-particles?
             lambda cps: -self.stein_loss.loss(
@@ -315,8 +316,8 @@ class SteinVI:
                 handlers.scale(self._inference_model, self.loss_temperature),
                 self.guide,
                 batch_unravel_fn(ctps),
-                *args,
-                **kwargs,
+                *model_args,
+                **model_kwargs,
             )
         )(uparams)
         return non_mixture_param_grads
@@ -346,11 +347,19 @@ class SteinVI:
         )
         attr_key, classic_key = random.split(rng_key)
 
-        # 2.2 Compute non-mixture parameter gradients
-        non_mixture_param_grads = _grad_params(self, rng_key, ps, args, kwargs)
+        # 2. Compute non-particle parameter gradients
+        non_mixture_param_grads = self._grad_params(rng_key=classic_key, 
+                                                    ps=ps, 
+                                                    uparams=uparams, 
+                                                    unravel_fn=unravel_fn, 
+                                                    batch_unravel_fn=batch_unravel_fn, 
+                                                    model_args=args, 
+                                                    model_kwargs=kwargs
+                                                    )
 
+        # 3. Compute particle gradients
         attr_force = self._compute_attractive(attr_key, ps, pinfos, unravel_fn, uparams,*args, **kwargs)
-        repr_force = self._compute_repulsive(ps, pinfos)
+        repr_force = self._compute_repulsive(ps, pinfos, unravel_fn)
 
         def single_particle_grad(particle, attr_forces, rep_forces): # TODO: justify this!
             def _nontrivial_jac(var_name, var):
@@ -383,7 +392,7 @@ class SteinVI:
             vmap(single_particle_grad)(
                 ps, attr_force, repr_force 
             )
-            / self.num_stein_particles  # TODO: why divid here again?
+            # / self.num_stein_particles  # TODO: why divid here again?
         )
 
         # 5. Decompose the monolithic particle forces back to concrete parameter values
