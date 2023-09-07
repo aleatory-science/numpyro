@@ -94,7 +94,6 @@ class RBFKernel(SteinKernel):
 
     def compute(self, particles, particle_info, loss_fn):
         bandwidth = median_bandwidth(particles, self.bandwidth_factor)
-        print(bandwidth)
 
         def kernel(x, y):
             reduce = jnp.sum if self._normed() else lambda x: x
