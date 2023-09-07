@@ -407,12 +407,14 @@ class SteinVI:
             model_args=args,
             model_kwargs=kwargs,
         )
-        repr_force = self._compute_repulsive(ps=ps, 
-                                             pinfos=pinfos, 
-                                             unravel_fn=unravel_fn)
+        repr_force = self._compute_repulsive(
+            ps=ps, pinfos=pinfos, unravel_fn=unravel_fn
+        )
 
         particle_grads = (
-            vmap(partial(self._compute_stein_force, unravel_fn=unravel_fn))(ps, attr_force, repr_force)
+            vmap(partial(self._compute_stein_force, unravel_fn=unravel_fn))(
+                ps, attr_force, repr_force
+            )
             / self.num_stein_particles
         )  # TODO: why divid here again? just scales the gradient
 
