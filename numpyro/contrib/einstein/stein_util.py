@@ -29,17 +29,14 @@ def all_pairs_eucl_dist(a, b):
     a_sqr = jnp.sum(a**2, 1)[None, :]
     b_sqr = jnp.sum(b**2, 1)[:, None]
     diff = jnp.matmul(b, a.T)
-    return jnp.sqrt(jnp.maximum(a_sqr + b_sqr - 2 * diff, 0.0))
+    return jnp.maximum(a_sqr + b_sqr - 2 * diff, 0.0)
 
 
 def median_bandwidth(particles, factor_fn):
     if particles.shape[0] == 1:
         return 1.0  # Median produces NaN for single particle
     dists = all_pairs_eucl_dist(particles, particles)
-    bandwidth = (
-        jnp.median(dists) ** 2 * factor_fn(particles.shape[0])
-        + jnp.finfo(dists.dtype).eps
-    )
+    bandwidth = jnp.median(dists) * factor_fn(particles.shape[0]) + jnp.finfo(dists.dtype).eps
     return bandwidth
 
 

@@ -79,7 +79,7 @@ class RBFKernel(SteinKernel):
         self,
         mode="norm",
         matrix_mode="norm_diag",
-        bandwidth_factor: Callable[[float], float] = lambda n: 1 / jnp.log(n),
+        bandwidth_factor: Callable[[float], float] = lambda n: 1 / jnp.log1p(n),
     ):
         assert mode == "norm" or mode == "vector" or mode == "matrix"
         assert matrix_mode == "norm_diag" or matrix_mode == "vector_diag"
@@ -94,10 +94,11 @@ class RBFKernel(SteinKernel):
 
     def compute(self, particles, particle_info, loss_fn):
         bandwidth = median_bandwidth(particles, self.bandwidth_factor)
+        print(bandwidth)
 
         def kernel(x, y):
             reduce = jnp.sum if self._normed() else lambda x: x
-            kernel_res = jnp.exp(-reduce((x - y) ** 2) / stop_gradient(bandwidth))
+            kernel_res = jnp.exp(-0.5 * reduce((x - y) ** 2) / stop_gradient(bandwidth))
             if self._mode == "matrix":
                 if self.matrix_mode == "norm_diag":
                     return kernel_res * jnp.identity(x.shape[0])
