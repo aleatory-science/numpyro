@@ -288,7 +288,7 @@ class SteinVI:
         )
 
         force = vmap(
-            lambda y: jnp.mean(
+            lambda y: jnp.sum(
                 vmap(
                     lambda x: self.repulsion_temperature
                     * self._kernel_grad(kernel, x, y)
@@ -404,17 +404,15 @@ class SteinVI:
             pinfos=pinfos,
             unravel_fn=unravel_fn,
             uparams=uparams,
-            model_args=args,
-            model_kwargs=kwargs,
+            *args,
+            **kwargs,
         )
-        repr_force = self._compute_repulsive(
-            ps=ps, pinfos=pinfos, unravel_fn=unravel_fn
-        )
+        repr_force = self._compute_repulsive(ps=ps, 
+                                             pinfos=pinfos, 
+                                             unravel_fn=unravel_fn)
 
         particle_grads = (
-            vmap(partial(self._compute_stein_force, unravel_fn=unravel_fn))(
-                ps, attr_force, repr_force
-            )
+            vmap(self._compute_stein_force)(ps, attr_force, repr_force)
             / self.num_stein_particles
         )  # TODO: why divid here again? just scales the gradient
 
@@ -426,6 +424,101 @@ class SteinVI:
             lambda x: -x, {**non_mixture_param_grads, **stein_param_grads}
         )
         return jnp.linalg.norm(particle_grads), res_grads
+    
+    def _sp_mcmc(self, rng_key, unconstr_params, *args, **kwargs):  # TODO: why only do a subset of particles?
+        # 0. Separate classical and stein parameters
+        classic_uparams = {
+            p: v
+            for p, v in unconstr_params.items()
+            if p not in self.guide_param_names or self.classic_guide_params_fn(p)
+        }
+        stein_uparams = {
+            p: v for p, v in unconstr_params.items() if p not in classic_uparams
+        }
+
+        # 1. Run warmup on a subset of particles to tune the MCMC state
+        warmup_key, mcmc_key = jax.random.split(rng_key)
+        sampler = self.mcmc_kernel(
+            potential_fn=lambda params: self.loss.loss(
+                warmup_key,
+                {**params, **self.constrain_fn(classic_uparams)},
+                self._inference_model,
+                self.guide,
+                *args,
+                **kwargs
+            )
+        )
+        mcmc = MCMC(
+            sampler,
+            num_warmup=self.num_mcmc_warmup,
+            num_samples=self.num_mcmc_updates,
+            num_chains=self.num_mcmc_particles,
+            progress_bar=False,
+            chain_method="vectorized",
+            **self.mcmc_kwargs
+        )
+        stein_params = self.constrain_fn(stein_uparams)
+        stein_subset_params = {
+            p: v[0 : self.num_mcmc_particles] for p, v in stein_params.items()
+        }
+        mcmc.warmup(warmup_key, *args, init_params=stein_subset_params, **kwargs)
+
+        # 2. Choose MCMC particles
+        mcmc_key, choice_key = jax.random.split(mcmc_key)
+        if self.num_mcmc_particles == self.num_particles:
+            idxs = jnp.arange(self.num_particles)
+        else:
+            if self.sp_mcmc_crit == "rand":
+                idxs = jax.random.permutation(
+                    choice_key, jnp.arange(self.num_particles)
+                )[: self.num_mcmc_particles]
+            elif self.sp_mcmc_crit == "infl":
+                _, grads = self._svgd_loss_and_grads(
+                    choice_key, unconstr_params, *args, **kwargs
+                )
+                ksd = jnp.linalg.norm(
+                    jnp.concatenate(
+                        [
+                            jnp.reshape(grads[p], (self.num_particles, -1))
+                            for p in stein_uparams.keys()
+                        ],
+                        axis=-1,
+                    ),
+                    ord=2,
+                    axis=-1,
+                )
+                idxs = jnp.argsort(ksd)[: self.num_mcmc_particles]
+            else:
+                assert False, "Unsupported SP MCMC criterion: {}".format(
+                    self.sp_mcmc_crit
+                )
+
+        # 3. Run MCMC on chosen particles
+        stein_params = self.constrain_fn(stein_uparams)
+        stein_subset_params = {p: v[idxs] for p, v in stein_params.items()}
+        mcmc.run(mcmc_key, *args, init_params=stein_subset_params, **kwargs)
+        samples_subset_stein_params = mcmc.get_samples(group_by_chain=True)
+        sss_uparams = self.uconstrain_fn(samples_subset_stein_params)
+
+        # 4. Select best MCMC iteration to update particles
+        scores = jax.vmap(
+            lambda i: self._score_sp_mcmc(
+                mcmc_key,
+                idxs,
+                stein_uparams,
+                {p: v[:, i] for p, v in sss_uparams.items()},
+                classic_uparams,
+                *args,
+                **kwargs
+            )
+        )(jnp.arange(self.num_mcmc_particles))
+        mcmc_idx = jnp.argmax(scores)
+        stein_uparams = {
+            p: ops.index_update(v, idxs, sss_uparams[p][:, mcmc_idx])
+            for p, v in stein_uparams.items()
+        }
+        return {**stein_uparams, **classic_uparams}
+
 
     def init(self, rng_key: KeyArray, *args, **kwargs):
         """Register random variable transformations, constraints and determine initialize positions of the particles.
