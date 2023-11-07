@@ -15,6 +15,11 @@ import jax.scipy.stats
 from numpyro.contrib.einstein.stein_util import median_bandwidth
 from numpyro.distributions import biject_to
 from numpyro.infer.autoguide import AutoNormal
+from numpyro.infer.util import log_density
+
+from numpyro.handlers import seed, trace, substitute, replay
+from numpyro import prng_key
+
 
 
 class SteinKernel(ABC):
@@ -373,6 +378,47 @@ class GraphicalKernel(SteinKernel):
             return jax.scipy.linalg.block_diag(*kernel_res)
 
         return kernel
+
+
+class ProductKernel(SteinKernel):
+    def __init__(self, guide, scale=1.0):
+        self._mode = "norm"
+        self.guide = guide
+        self.scale = scale
+
+    def compute(
+        self,
+        particles: jnp.ndarray,
+        particle_info: dict[str, tuple[int, int]],
+        loss_fn: Callable[[jnp.ndarray], float],
+    ):
+ 
+        def kernel(rng_key, x, y, model_args, model_kwargs, unravel_fn):  
+            # TODO: should the kernel take an rng_key  
+            # TODO: maybe a new subclass?
+            # TODO: x and y are arrays!
+            xkey, ykey = random.split(rng_key)
+
+            x = unravel_fn(x)
+            y = unravel_fn(y)
+
+
+            with seed(rng_seed=xkey), substitute(data=x), trace() as xtr:
+                self.guide(*model_args, **model_kwargs)
+
+            with seed(rng_seed=ykey), substitute(data=y), trace() as ytr:
+                self.guide(*model_args, **model_kwargs)
+    
+            xlog_p, _ = log_density(replay(self.guide, ytr), model_args, model_kwargs, x)
+            ylog_p, _ = log_density(replay(self.guide, xtr), model_args, model_kwargs, y)
+            return self.scale * (xlog_p + ylog_p)
+
+        return kernel
+
+    @property
+    def mode(self):
+        return self._mode
+
 
 
 class ProbabilityProductKernel(SteinKernel):

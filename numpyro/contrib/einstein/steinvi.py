@@ -155,23 +155,23 @@ class SteinVI:
         self.particle_transform_fn = None
         self.particle_transforms = None
 
-    def _apply_kernel(self, kernel, x, y, v):
+    def _apply_kernel(self, kernel, x, y, v, args, kwargs, rng_key, unravel_fn):
         if self.kernel_fn.mode == "norm" or self.kernel_fn.mode == "vector":
-            return kernel(x, y) * v
+            return kernel(rng_key, x, y, args, kwargs, unravel_fn) * v
         else:
-            return kernel(x, y) @ v
+            return kernel(rng_key, x, y, args, kwargs, unravel_fn) @ v
 
-    def _kernel_grad(self, kernel, x, y):
+    def _kernel_grad(self, kernel, x, y, args, kwargs, rng_key, unravel_fn):
         if self.kernel_fn.mode == "norm":
-            return grad(lambda x: kernel(x, y))(x)
+            return grad(lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn))(x)
         elif self.kernel_fn.mode == "vector":
-            return vmap(lambda i: grad(lambda x: kernel(x, y)[i])(x)[i])(
+            return vmap(lambda i: grad(lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[i])(x)[i])(
                 jnp.arange(x.shape[0])
             )
         else:
             return vmap(
                 lambda a: jnp.sum(
-                    vmap(lambda b: grad(lambda x: kernel(x, y)[a, b])(x)[b])(
+                    vmap(lambda b: grad(lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[a, b])(x)[b])(
                         jnp.arange(x.shape[0])
                     )
                 )
@@ -236,7 +236,7 @@ class SteinVI:
         particle_info, _ = self._calc_particle_info(
             stein_uparams, stein_particles.shape[0]
         )
-        attractive_key, classic_key = random.split(rng_key)
+        kernel_key, attractive_key, classic_key = random.split(rng_key, 3)
 
         # 2. Calculate gradients for each particle
         def kernel_particles_loss_fn(
@@ -300,20 +300,21 @@ class SteinVI:
         attractive_force = vmap(
             lambda y: jnp.sum(
                 vmap(
-                    lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad)
-                )(tstein_particles, particle_ljp_grads),
+                    lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad, args, kwargs, kernel_key, unravel_pytree)
+                )(ctstein_particles, particle_ljp_grads),
                 axis=0,
             )
-        )(tstein_particles)
+
+        )(ctstein_particles)
         repulsive_force = vmap(
             lambda y: jnp.sum(
                 vmap(
                     lambda x: self.repulsion_temperature
-                    * self._kernel_grad(kernel, x, y)
-                )(tstein_particles),
+                    * self._kernel_grad(kernel, x, y, args, kwargs, kernel_key, unravel_pytree)
+                )(ctstein_particles),
                 axis=0,
             )
-        )(tstein_particles)
+        )(ctstein_particles)
 
         def single_particle_grad(particle, attr_forces, rep_forces):
             def _nontrivial_jac(var_name, var):

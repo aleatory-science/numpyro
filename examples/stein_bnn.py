@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpyro
 from numpyro import deterministic
 from numpyro.contrib.einstein import IMQKernel, SteinVI
+from numpyro.contrib.einstein.stein_kernels import ProductKernel
 from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredictive
 from numpyro.distributions import Gamma, Normal
 from numpyro.examples.datasets import BOSTON_HOUSING, load_dataset
@@ -135,8 +136,7 @@ def main(args):
         model,
         guide,
         Adagrad(0.05),
-        IMQKernel(),
-        # ProbabilityProductKernel(guide=guide, scale=1.),
+        ProductKernel(guide=guide, scale=1.),
         repulsion_temperature=args.repulsion,
         num_stein_particles=args.num_stein_particles,
         num_elbo_particles=args.num_elbo_particles,
