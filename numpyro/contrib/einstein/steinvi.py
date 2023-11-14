@@ -165,15 +165,21 @@ class SteinVI:
         if self.kernel_fn.mode == "norm":
             return grad(lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn))(x)
         elif self.kernel_fn.mode == "vector":
-            return vmap(lambda i: grad(lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[i])(x)[i])(
-                jnp.arange(x.shape[0])
-            )
+            return vmap(
+                lambda i: grad(
+                    lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[i]
+                )(x)[i]
+            )(jnp.arange(x.shape[0]))
         else:
             return vmap(
                 lambda a: jnp.sum(
-                    vmap(lambda b: grad(lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[a, b])(x)[b])(
-                        jnp.arange(x.shape[0])
-                    )
+                    vmap(
+                        lambda b: grad(
+                            lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[
+                                a, b
+                            ]
+                        )(x)[b]
+                    )(jnp.arange(x.shape[0]))
                 )
             )(jnp.arange(x.shape[0]))
 
@@ -300,17 +306,27 @@ class SteinVI:
         attractive_force = vmap(
             lambda y: jnp.sum(
                 vmap(
-                    lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad, args, kwargs, kernel_key, unravel_pytree)
+                    lambda x, x_ljp_grad: self._apply_kernel(
+                        kernel,
+                        x,
+                        y,
+                        x_ljp_grad,
+                        args,
+                        kwargs,
+                        kernel_key,
+                        unravel_pytree,
+                    )
                 )(ctstein_particles, particle_ljp_grads),
                 axis=0,
             )
-
         )(ctstein_particles)
         repulsive_force = vmap(
             lambda y: jnp.sum(
                 vmap(
                     lambda x: self.repulsion_temperature
-                    * self._kernel_grad(kernel, x, y, args, kwargs, kernel_key, unravel_pytree)
+                    * self._kernel_grad(
+                        kernel, x, y, args, kwargs, kernel_key, unravel_pytree
+                    )
                 )(ctstein_particles),
                 axis=0,
             )

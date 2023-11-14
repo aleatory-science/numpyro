@@ -26,8 +26,8 @@ import jax.numpy as jnp
 import numpyro
 from numpyro import deterministic
 from numpyro.contrib.einstein import IMQKernel, SteinVI
-from numpyro.contrib.einstein.stein_kernels import ProductKernel
 from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredictive
+from numpyro.contrib.einstein.stein_kernels import ProductKernel
 from numpyro.distributions import Gamma, Normal
 from numpyro.examples.datasets import BOSTON_HOUSING, load_dataset
 from numpyro.infer import init_to_uniform
@@ -69,27 +69,30 @@ def model(x, y=None, hidden_dim=50, subsample_size=100):
 
     n, m = x.shape
 
-    with numpyro.plate("l1_hidden", hidden_dim, dim=-1):
-        # prior l1 bias term
-        b1 = numpyro.sample(
-            "nn_b1",
-            Normal(
-                0.0,
-                1.0 / jnp.sqrt(prec_nn),
-            ),
+    # prior l1 bias term
+    b1 = numpyro.sample(
+        "nn_b1",
+        Normal(
+            0.0,
+            1.0 / jnp.sqrt(prec_nn),
         )
-        assert b1.shape == (hidden_dim,)
+        .expand((hidden_dim,))
+        .to_event(1),
+    )
+    assert b1.shape == (hidden_dim,)
 
-        with numpyro.plate("l1_feat", m, dim=-2):
-            w1 = numpyro.sample(
-                "nn_w1", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
-            )  # prior on l1 weights
-            assert w1.shape == (m, hidden_dim)
+    # with numpyro.plate("l1_hidden", hidden_dim, dim=-1):
+    #     with numpyro.plate("l1_feat", m, dim=-2):
+    w1 = numpyro.sample(
+        "nn_w1",
+        Normal(0.0, 1.0 / jnp.sqrt(prec_nn)).expand((m, hidden_dim)).to_event(2),
+    )  # prior on l1 weights
+    assert w1.shape == (m, hidden_dim)
 
-    with numpyro.plate("l2_hidden", hidden_dim, dim=-1):
-        w2 = numpyro.sample(
-            "nn_w2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
-        )  # prior on output weights
+    # with numpyro.plate("l2_hidden", hidden_dim, dim=-1):
+    w2 = numpyro.sample(
+        "nn_w2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn)).expand((hidden_dim,)).to_event(1)
+    )  # prior on output weights
 
     b2 = numpyro.sample(
         "nn_b2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
@@ -136,7 +139,7 @@ def main(args):
         model,
         guide,
         Adagrad(0.05),
-        ProductKernel(guide=guide, scale=1.),
+        ProductKernel(guide=guide, scale=1.0),
         repulsion_temperature=args.repulsion,
         num_stein_particles=args.num_stein_particles,
         num_elbo_particles=args.num_elbo_particles,
@@ -154,6 +157,8 @@ def main(args):
         progress_bar=args.progress_bar,
     )
     time_taken = time() - start
+
+    print(stein.get_params(result.state))
 
     pred = MixtureGuidePredictive(
         model,
@@ -200,11 +205,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--subsample-size", type=int, default=100)
-    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--max-iter", type=int, default=1_000)
     parser.add_argument("--repulsion", type=float, default=1.0)
     parser.add_argument("--verbose", type=bool, default=True)
     parser.add_argument("--num-elbo-particles", type=int, default=50)
-    parser.add_argument("--num-stein-particles", type=int, default=5)
+    parser.add_argument("--num-stein-particles", type=int, default=2)
     parser.add_argument("--progress-bar", type=bool, default=True)
     parser.add_argument("--rng-key", type=int, default=142)
     parser.add_argument("--device", default="cpu", choices=["gpu", "cpu"])

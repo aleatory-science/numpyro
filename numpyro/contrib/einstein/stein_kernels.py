@@ -6,20 +6,23 @@ from collections.abc import Callable
 
 import numpy as np
 
-from jax import random
+from jax import numpy as jnp, random
 from jax.lax import stop_gradient
-import jax.numpy as jnp
 import jax.scipy.linalg
+from jax.scipy.special import logsumexp
 import jax.scipy.stats
 
+from numpyro import prng_key
 from numpyro.contrib.einstein.stein_util import median_bandwidth
 from numpyro.distributions import biject_to
+from numpyro.handlers import replay, seed, substitute, trace
 from numpyro.infer.autoguide import AutoNormal
-from numpyro.infer.util import log_density
-
-from numpyro.handlers import seed, trace, substitute, replay
-from numpyro import prng_key
-
+from numpyro.infer.util import (
+    _without_rsample_stop_gradient,
+    is_identically_one,
+    log_density,
+)
+from numpyro.util import check_model_guide_match
 
 
 class SteinKernel(ABC):
@@ -392,33 +395,101 @@ class ProductKernel(SteinKernel):
         particle_info: dict[str, tuple[int, int]],
         loss_fn: Callable[[jnp.ndarray], float],
     ):
- 
-        def kernel(rng_key, x, y, model_args, model_kwargs, unravel_fn):  
-            # TODO: should the kernel take an rng_key  
+        def kernel(rng_key, x, y, model_args, model_kwargs, unravel_fn):
             # TODO: maybe a new subclass?
-            # TODO: x and y are arrays!
             xkey, ykey = random.split(rng_key)
 
             x = unravel_fn(x)
             y = unravel_fn(y)
 
-
-            with seed(rng_seed=xkey), substitute(data=x), trace() as xtr:
+            # TODO: what is effect of _without_rsample_stop_gradient?
+            with _without_rsample_stop_gradient(), seed(rng_seed=xkey), substitute(
+                data=x
+            ), trace() as xtr:
                 self.guide(*model_args, **model_kwargs)
 
-            with seed(rng_seed=ykey), substitute(data=y), trace() as ytr:
+            with _without_rsample_stop_gradient(), seed(rng_seed=ykey), substitute(
+                data=y
+            ), trace() as ytr:
                 self.guide(*model_args, **model_kwargs)
-    
-            xlog_p, _ = log_density(replay(self.guide, ytr), model_args, model_kwargs, x)
-            ylog_p, _ = log_density(replay(self.guide, xtr), model_args, model_kwargs, y)
-            return self.scale * (xlog_p + ylog_p)
+
+            check_model_guide_match(xtr, ytr)
+
+            with replay(trace=xtr), substitute(data=y), trace() as tmpytr:
+                self.guide(*model_args, **model_kwargs)
+
+            with replay(trace=ytr), substitute(data=x), trace() as xtr:
+                self.guide(*model_args, **model_kwargs)
+
+            ytr = tmpytr
+
+            for tr in (xtr, ytr):
+                for site in tr.values():
+                    if site["type"] == "sample":
+                        if "log_prob" not in site:
+                            value = site["value"]
+                            intermediates = site["intermediates"]
+                            scale = site["scale"]
+                            if intermediates:
+                                log_prob = site["fn"].log_prob(value, intermediates)
+                            else:
+                                log_prob = site["fn"].log_prob(value)
+
+                            if (scale is not None) and (not is_identically_one(scale)):
+                                log_prob = scale * log_prob
+                            site["log_prob"] = log_prob
+
+            site_plates = {
+                name: {frame for frame in site["cond_indep_stack"]}
+                for name, site in xtr.items()
+                if site["type"] == "sample"
+            }
+
+            # We will compute product kernel separately across dimensions
+            # defined in indep_plates. Then the final elbo is the sum
+            # of those independent elbos.
+            if site_plates:
+                indep_plates = set.intersection(*site_plates.values())
+            else:
+                indep_plates = set()
+
+            for frame in set.union(*site_plates.values()):
+                if frame not in indep_plates:
+                    subsample_size = frame.size
+                    size = xtr[frame.name]["args"][0]
+                    if size > subsample_size:
+                        raise ValueError(
+                            "ProductKernel only supports subsampling in plates that are common"
+                            " to all sample sites, e.g. a data plate that encloses the"
+                            " entire model."
+                        )
+
+            indep_plate_dims = {frame.dim for frame in indep_plates}
+
+            kval = 0.0
+            for site_name in xtr:
+                xsite = xtr[site_name]
+                ysite = ytr[site_name]
+                if xsite["type"] != "sample":
+                    continue
+                lp = xsite["log_prob"] + ysite["log_prob"]
+                sq_axes = ()
+                for dim in range(lp.ndim):
+                    neg_dim = dim - lp.ndim
+                    if neg_dim in indep_plate_dims:
+                        continue
+                    lp = logsumexp(lp, axis=dim, keepdims=True)
+                    sq_axes = sq_axes + (dim,)
+
+                kval = kval + jnp.squeeze(lp, sq_axes)
+
+            return self.scale * kval
 
         return kernel
 
     @property
     def mode(self):
         return self._mode
-
 
 
 class ProbabilityProductKernel(SteinKernel):
