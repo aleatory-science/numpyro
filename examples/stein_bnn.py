@@ -70,29 +70,30 @@ def model(x, y=None, hidden_dim=50, subsample_size=100):
     n, m = x.shape
 
     # prior l1 bias term
-    b1 = numpyro.sample(
-        "nn_b1",
-        Normal(
-            0.0,
-            1.0 / jnp.sqrt(prec_nn),
-        )
-        .expand((hidden_dim,))
-        .to_event(1),
-    )
-    assert b1.shape == (hidden_dim,)
 
-    # with numpyro.plate("l1_hidden", hidden_dim, dim=-1):
-    #     with numpyro.plate("l1_feat", m, dim=-2):
-    w1 = numpyro.sample(
-        "nn_w1",
-        Normal(0.0, 1.0 / jnp.sqrt(prec_nn)).expand((m, hidden_dim)).to_event(2),
-    )  # prior on l1 weights
-    assert w1.shape == (m, hidden_dim)
+    with numpyro.plate("l1_hidden", hidden_dim, dim=-1):
 
-    # with numpyro.plate("l2_hidden", hidden_dim, dim=-1):
-    w2 = numpyro.sample(
-        "nn_w2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn)).expand((hidden_dim,)).to_event(1)
-    )  # prior on output weights
+        b1 = numpyro.sample(
+            "nn_b1",
+            Normal(
+                0.0,
+                1.0 / jnp.sqrt(prec_nn),
+            ))
+        assert b1.shape == (hidden_dim,)
+
+        with numpyro.plate("l1_feat", m, dim=-2):
+            w1 = numpyro.sample(
+                "nn_w1",
+                Normal(0.0, 1.0 / jnp.sqrt(prec_nn)),
+            )  # prior on l1 weights
+
+            assert w1.shape == (m, hidden_dim)
+
+    with numpyro.plate("l2_hidden", hidden_dim, dim=-1):
+        w2 = numpyro.sample(
+            "nn_w2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
+        )  # prior on output weights
+        assert w2.shape == (hidden_dim,)
 
     b2 = numpyro.sample(
         "nn_b2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
