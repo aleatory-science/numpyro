@@ -25,7 +25,7 @@ import jax.numpy as jnp
 
 import numpyro
 from numpyro import deterministic
-from numpyro.contrib.einstein import IMQKernel, SteinVI
+from numpyro.contrib.einstein import SteinVI
 from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredictive
 from numpyro.contrib.einstein.stein_kernels import ProductKernel
 from numpyro.distributions import Gamma, Normal
@@ -145,6 +145,7 @@ def main(args):
         num_stein_particles=args.num_stein_particles,
         num_elbo_particles=args.num_elbo_particles,
     )
+
     start = time()
 
     # use keyword params for static (shape etc.)!
@@ -158,8 +159,6 @@ def main(args):
         progress_bar=args.progress_bar,
     )
     time_taken = time() - start
-
-    print(stein.get_params(result.state))
 
     pred = MixtureGuidePredictive(
         model,
@@ -206,7 +205,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--subsample-size", type=int, default=100)
-    parser.add_argument("--max-iter", type=int, default=1_000)
+    parser.add_argument("--max-iter", type=int, default=4_000)
     parser.add_argument("--repulsion", type=float, default=1.0)
     parser.add_argument("--verbose", type=bool, default=True)
     parser.add_argument("--num-elbo-particles", type=int, default=50)
