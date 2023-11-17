@@ -72,13 +72,13 @@ def model(x, y=None, hidden_dim=50, subsample_size=100):
     # prior l1 bias term
 
     with numpyro.plate("l1_hidden", hidden_dim, dim=-1):
-
         b1 = numpyro.sample(
             "nn_b1",
             Normal(
                 0.0,
                 1.0 / jnp.sqrt(prec_nn),
-            ))
+            ),
+        )
         assert b1.shape == (hidden_dim,)
 
         with numpyro.plate("l1_feat", m, dim=-2):
