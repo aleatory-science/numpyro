@@ -63,7 +63,7 @@ class SteinVI:
 
         >>> data = jnp.concatenate([jnp.ones(6), jnp.zeros(4)])
         >>> optimizer = numpyro.optim.Adam(step_size=0.0005)
-        >>> stein = SteinVI(model, guide, optimizer, kernel_fn=RBFKernel())
+        >>> stein = SteinVI(model, guide, optimizer, kernel=RBFKernel())
         >>> stein_result = stein.run(random.PRNGKey(0), 2000, data)
         >>> params = stein_result.params
         >>> # use guide to make predictive
@@ -74,7 +74,7 @@ class SteinVI:
     :param guide: Python callable with Pyro primitives for the guide
         (recognition network).
     :param _NumPyroOptim optim: An instance of :class:`~numpyro.optim._NumpyroOptim`.
-    :param SteinKernel kernel_fn: Function that produces a logarithm of the statistical kernel to use with Stein mixture
+    :param SteinKernel kernel: Function that produces a logarithm of the statistical kernel to use with Stein mixture
         inference.
     :param num_stein_particles: Number of particles (i.e., mixture components) in the Stein mixture.
     :param num_elbo_particles: Number of Monte Carlo draws used to approximate the attractive force gradient.
@@ -92,7 +92,7 @@ class SteinVI:
         model: Callable,
         guide: Callable,
         optim: _NumPyroOptim,
-        kernel_fn: SteinKernel,
+        kernel: SteinKernel,
         num_stein_particles: int = 10,
         num_elbo_particles: int = 10,
         loss_temperature: float = 1.0,
@@ -142,7 +142,7 @@ class SteinVI:
             elbo_num_particles=num_elbo_particles,
             stein_num_particles=num_stein_particles,
         )
-        self.kernel_fn = kernel_fn
+        self.kernel = kernel
         self.static_kwargs = static_kwargs
         self.num_stein_particles = num_stein_particles
         self.loss_temperature = loss_temperature
@@ -155,33 +155,6 @@ class SteinVI:
         self.particle_transform_fn = None
         self.particle_transforms = None
 
-    def _apply_kernel(self, kernel, x, y, v, args, kwargs, rng_key, unravel_fn):
-        if self.kernel_fn.mode == "norm" or self.kernel_fn.mode == "vector":
-            return kernel(rng_key, x, y, args, kwargs, unravel_fn) * v
-        else:
-            return kernel(rng_key, x, y, args, kwargs, unravel_fn) @ v
-
-    def _kernel_grad(self, kernel, x, y, args, kwargs, rng_key, unravel_fn):
-        if self.kernel_fn.mode == "norm":
-            return grad(lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn))(x)
-        elif self.kernel_fn.mode == "vector":
-            return vmap(
-                lambda i: grad(
-                    lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[i]
-                )(x)[i]
-            )(jnp.arange(x.shape[0]))
-        else:
-            return vmap(
-                lambda a: jnp.sum(
-                    vmap(
-                        lambda b: grad(
-                            lambda x: kernel(rng_key, x, y, args, kwargs, unravel_fn)[
-                                a, b
-                            ]
-                        )(x)[b]
-                    )(jnp.arange(x.shape[0]))
-                )
-            )(jnp.arange(x.shape[0]))
 
     def _param_size(self, param):
         if isinstance(param, tuple) or isinstance(param, list):
@@ -298,23 +271,20 @@ class SteinVI:
         )(non_mixture_uparams)
 
         # 3. Calculate kernel of particles
-        kernel = self.kernel_fn.compute(
-            stein_particles, particle_info, kernel_particles_loss_fn
+        kernel_fn = self.kernel.compute(
+            stein_particles, particle_info, kernel_particles_loss_fn, args, kwargs
         )
 
         # 4. Calculate the attractive force and repulsive force on the particles
         attractive_force = vmap(
             lambda y: jnp.sum(
                 vmap(
-                    lambda x, x_ljp_grad: self._apply_kernel(
-                        kernel,
+                    lambda x, x_ljp_grad: self.kernel.apply_kernel(
+                        kernel_key,
+                        kernel_fn,
                         x,
                         y,
                         x_ljp_grad,
-                        args,
-                        kwargs,
-                        kernel_key,
-                        unravel_pytree,
                     )
                 )(ctstein_particles, particle_ljp_grads),
                 axis=0,
@@ -324,9 +294,7 @@ class SteinVI:
             lambda y: jnp.sum(
                 vmap(
                     lambda x: self.repulsion_temperature
-                    * self._kernel_grad(
-                        kernel, x, y, args, kwargs, kernel_key, unravel_pytree
-                    )
+                    * self.kernel.kernel_grad(kernel_key, kernel_fn, x, y)
                 )(ctstein_particles),
                 axis=0,
             )
@@ -449,7 +417,7 @@ class SteinVI:
         self.uconstrain_fn = partial(transform_fn, transforms)
         self.particle_transforms = particle_transforms
         self.particle_transform_fn = partial(transform_fn, particle_transforms)
-        stein_particles, _, _ = batch_ravel_pytree(
+        stein_particles, unravel_fn, _ = batch_ravel_pytree(
             {
                 k: params[k]
                 for k, site in guide_trace.items()
@@ -458,7 +426,7 @@ class SteinVI:
             nbatch_dims=1,
         )
 
-        self.kernel_fn.init(kernel_seed, stein_particles.shape)
+        self.kernel.init(kernel_seed, stein_particles.shape, unravel_fn)
         return SteinVIState(self.optim.init(params), rng_key)
 
     def get_params(self, state: SteinVIState):

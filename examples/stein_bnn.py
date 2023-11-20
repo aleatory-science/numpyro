@@ -27,7 +27,7 @@ import numpyro
 from numpyro import deterministic
 from numpyro.contrib.einstein import SteinVI
 from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredictive
-from numpyro.contrib.einstein.stein_kernels import ProductKernel
+from numpyro.contrib.einstein.stein_kernels import ProductKernel, RBFKernel
 from numpyro.distributions import Gamma, Normal
 from numpyro.examples.datasets import BOSTON_HOUSING, load_dataset
 from numpyro.infer import init_to_uniform
@@ -140,7 +140,8 @@ def main(args):
         model,
         guide,
         Adagrad(0.05),
-        ProductKernel(guide=guide, scale=1.0),
+        # ProductKernel(guide=guide, scale=1.0),
+        RBFKernel(),
         repulsion_temperature=args.repulsion,
         num_stein_particles=args.num_stein_particles,
         num_elbo_particles=args.num_elbo_particles,
@@ -205,14 +206,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--subsample-size", type=int, default=100)
-    parser.add_argument("--max-iter", type=int, default=4_000)
+    parser.add_argument("--max-iter", type=int, default=1_000)
     parser.add_argument("--repulsion", type=float, default=1.0)
     parser.add_argument("--verbose", type=bool, default=True)
-    parser.add_argument("--num-elbo-particles", type=int, default=50)
-    parser.add_argument("--num-stein-particles", type=int, default=2)
+    parser.add_argument("--num-elbo-particles", type=int, default=1)
+    parser.add_argument("--num-stein-particles", type=int, default=10)
     parser.add_argument("--progress-bar", type=bool, default=True)
     parser.add_argument("--rng-key", type=int, default=142)
-    parser.add_argument("--device", default="cpu", choices=["gpu", "cpu"])
+    parser.add_argument("--device", default="gpu", choices=["gpu", "cpu"])
     parser.add_argument("--hidden-dim", default=50, type=int)
 
     args = parser.parse_args()

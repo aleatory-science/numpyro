@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from jax import numpy as jnp, random
+from jax import numpy as jnp, random, grad
 from jax.lax import stop_gradient
 import jax.scipy.linalg
 from jax.scipy.special import logsumexp
@@ -40,6 +40,8 @@ class SteinKernel(ABC):
         particles: jnp.ndarray,
         particle_info: dict[str, tuple[int, int]],
         loss_fn: Callable[[jnp.ndarray], float],
+        model_args: tuple,
+        model_kwargs: dict,
     ):
         """
         Computes the kernel function given the input Stein particles
@@ -48,19 +50,44 @@ class SteinKernel(ABC):
         :param particle_info: A mapping from parameter names to the position in the
             particle matrix
         :param loss_fn: Loss function given particles
+        :param model_args: TODO: fill me in
+        :param model_kwargs: TODO: fill me in
         :return: The kernel_fn to compute kernel for pair of particles.
             Modes: norm `(d,) (d,)-> ()`, vector `(d,) (d,) -> (d)`, or matrix
             `(d,) (d,) -> (d,d)`
         """
         raise NotImplementedError
 
-    def init(self, rng_key, particles_shape):
+    def init(self, rng_key, particles_shape, unravel_fn):
         """
         Initializes the kernel
         :param rng_key: a JAX PRNGKey to initialize the kernel
         :param tuple particles_shape: shape of the input `particles` in :meth:`compute`
+        :param unravel_fn: maps particle to trace ? #TODO: check me.
         """
         pass
+
+    def apply_kernel(self, rng_key, kernel, x, y, v):
+        if self.mode == "norm" or self.mode == "vector":
+            return kernel(rng_key, x, y) * v
+        else:
+            return kernel(rng_key, x, y) @ v
+
+    def kernel_grad(self, rng_key, kernel, x, y):
+        if self.mode == "norm":
+            return grad(lambda x: kernel(rng_key, x, y))(x)
+        elif self.mode == "vector":
+            return vmap(lambda i: grad(lambda x: kernel(rng_key, x, y)[i])(x)[i])(
+                jnp.arange(x.shape[0])
+            )
+        else:
+            return vmap(
+                lambda a: jnp.sum(
+                    vmap(lambda b: grad(lambda x: kernel(rng_key, x, y)[a, b])(x)[b])(
+                        jnp.arange(x.shape[0])
+                    )
+                )
+            )(jnp.arange(x.shape[0]))
 
 
 class RBFKernel(SteinKernel):
@@ -100,10 +127,17 @@ class RBFKernel(SteinKernel):
             self.mode == "matrix" and self.matrix_mode == "norm_diag"
         )
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(
+        self,
+        particles,
+        particle_info,
+        loss_fn,
+        model_args: tuple,
+        model_kwargs: dict,
+    ):
         bandwidth = median_bandwidth(particles, self.bandwidth_factor)
 
-        def kernel(x, y):
+        def kernel(rng_key, x, y):
             reduce = jnp.sum if self._normed() else lambda x: x
             kernel_res = jnp.exp(-reduce((x - y) ** 2) / stop_gradient(bandwidth))
             if self._mode == "matrix":
@@ -152,8 +186,15 @@ class IMQKernel(SteinKernel):
     def _normed(self):
         return self._mode == "norm"
 
-    def compute(self, particles, particle_info, loss_fn):
-        def kernel(x, y):
+    def compute(
+        self,
+        particles,
+        particle_info,
+        loss_fn,
+        model_args: tuple,
+        model_kwargs: dict,
+    ):
+        def kernel(rng_key, x, y):
             reduce = jnp.sum if self._normed() else lambda x: x
             return (self.const**2 + reduce((x - y) ** 2)) ** self.expon
 
@@ -179,8 +220,15 @@ class LinearKernel(SteinKernel):
     def mode(self):
         return self._mode
 
-    def compute(self, particles: jnp.ndarray, particle_info, loss_fn):
-        def kernel(x, y):
+    def compute(
+        self,
+        particles: jnp.ndarray,
+        particle_info,
+        loss_fn,
+        model_args: tuple,
+        model_kwargs: dict,
+    ):
+        def kernel(rng_key, x, y):
             if x.ndim == 1:
                 return x @ y + 1
             else:
@@ -226,7 +274,7 @@ class RandomFeatureKernel(SteinKernel):
     def mode(self):
         return self._mode
 
-    def init(self, rng_key, particles_shape):
+    def init(self, rng_key, particles_shape, unravel_fn):
         rng_key, rng_weight, rng_bias = random.split(rng_key, 3)
         self._random_weights = random.normal(rng_weight, shape=particles_shape)
         self._random_biases = random.uniform(
@@ -237,7 +285,14 @@ class RandomFeatureKernel(SteinKernel):
                 rng_key, particles_shape[0], (self.bandwidth_subset,)
             )
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(
+        self,
+        particles,
+        particle_info,
+        loss_fn,
+        model_args: tuple,
+        model_kwargs: dict,
+    ):
         if self._random_weights is None:
             raise RuntimeError(
                 "The `.init` method should be called first to initialize the"
@@ -256,7 +311,7 @@ class RandomFeatureKernel(SteinKernel):
         def feature(x, w, b):
             return jnp.sqrt(2) * jnp.cos((x @ w + b) / bandwidth)
 
-        def kernel(x, y):
+        def kernel(rng_key, x, y):
             ws = (
                 self._random_weights
                 if self.random_indices is None
@@ -298,12 +353,19 @@ class MixtureKernel(SteinKernel):
     def mode(self):
         return self.kernel_fns[0].mode
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(
+        self,
+        particles,
+        particle_info,
+        loss_fn,
+        model_args: tuple,
+        model_kwargs: dict,
+    ):
         kernels = [
             kf.compute(particles, particle_info, loss_fn) for kf in self.kernel_fns
         ]
 
-        def kernel(x, y):
+        def kernel(rng_key, x, y):
             res = self.ws[0] * kernels[0](x, y)
             for w, k in zip(self.ws[1:], kernels[1:]):
                 res = res + w * k(x, y)
@@ -311,7 +373,7 @@ class MixtureKernel(SteinKernel):
 
         return kernel
 
-    def init(self, rng_key, particles_shape):
+    def init(self, rng_key, particles_shape, unravel_fn):
         for kf in self.kernel_fns:
             rng_key, krng_key = random.split(rng_key)
             kf.init(krng_key, particles_shape)
@@ -348,7 +410,14 @@ class GraphicalKernel(SteinKernel):
     def mode(self):
         return "matrix"
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(
+        self,
+        particles,
+        particle_info,
+        loss_fn,
+        model_args: tuple,
+        model_kwargs: dict,
+    ):
         def pk_loss_fn(start, end):
             def fn(ps):
                 return loss_fn(
@@ -369,7 +438,7 @@ class GraphicalKernel(SteinKernel):
             )
             local_kernels.append((pk_kernel, pk_kernel_fn.mode, start_idx, end_idx))
 
-        def kernel(x, y):
+        def kernel(rng_key, x, y):
             kernel_res = []
             for kernel, mode, start_idx, end_idx in local_kernels:
                 v = kernel(x[start_idx:end_idx], y[start_idx:end_idx])
@@ -388,19 +457,25 @@ class ProductKernel(SteinKernel):
         self._mode = "norm"
         self.guide = guide
         self.scale = scale
+        self.rng_key = None
+        self.particles_shape = None
+
+    def init(self, rng_key, particles_shape, unravel_fn):
+        self.unravel_fn = unravel_fn
 
     def compute(
         self,
         particles: jnp.ndarray,
         particle_info: dict[str, tuple[int, int]],
         loss_fn: Callable[[jnp.ndarray], float],
+        model_args: tuple,
+        model_kwargs: dict,
     ):
-        def kernel(rng_key, x, y, model_args, model_kwargs, unravel_fn):
-            # TODO: maybe a new subclass?
+        def kernel(rng_key, x, y):
             xkey, ykey = random.split(rng_key)
 
-            x = unravel_fn(x)
-            y = unravel_fn(y)
+            x = self.unravel_fn(x)
+            y = self.unravel_fn(y)
 
             # TODO: what is effect of _without_rsample_stop_gradient?
             with _without_rsample_stop_gradient(), seed(rng_seed=xkey), substitute(
@@ -481,7 +556,7 @@ class ProductKernel(SteinKernel):
                     lp = logsumexp(lp, axis=dim, keepdims=True)
                     sq_axes = sq_axes + (dim,)
 
-                kval = kval + jnp.squeeze(lp, sq_axes)
+                kval = kval + jnp.exp(jnp.squeeze(lp, sq_axes))
 
             return self.scale * kval
 
@@ -504,6 +579,8 @@ class ProbabilityProductKernel(SteinKernel):
         particles: jnp.ndarray,
         particle_info: dict[str, tuple[int, int]],
         loss_fn: Callable[[jnp.ndarray], float],
+        model_args,
+        model_kwargs,
     ):
         loc_idx = jnp.concatenate(
             [
@@ -520,7 +597,7 @@ class ProbabilityProductKernel(SteinKernel):
             ]
         )
 
-        def kernel(x, y):
+        def kernel(rng_key, x, y):
             biject = biject_to(self.guide.scale_constraint)
             x_loc = x[loc_idx]
             x_scale = biject(x[scale_idx])
