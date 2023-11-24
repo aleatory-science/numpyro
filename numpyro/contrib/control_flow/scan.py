@@ -15,21 +15,26 @@ from numpyro.primitives import _PYRO_STACK, Messenger, apply_stack
 from numpyro.util import not_jax_tracer
 
 
-def _replay_wrapper(replay_trace, seeded_fn_trace, i, length):
+def _replay_wrapper(replay_trace, trace, i, length):
     def get_ith_value(site):
-        if site["name"] not in seeded_fn_trace.keys():
+        if site["name"] not in trace:
             return site
-        shape = jnp.shape(site["value"])
-        if shape[0] == length:
-            site["value"] = site["value"][i]
-        elif shape[0] != length:
+        
+        site_len = jnp.shape(site["value"])[0]
+
+        if site_len != length:
             raise RuntimeError(
                 f"Replay value for site {site['name']} "
                 "requires length equal to scan length."
-                f" Expected length == {length}, but got {shape[0]}."
+                f" Expected length {length}, but got {site_len}."
             )
+        
+
+        site["value"] = site["value"][i]
         return site
+
     return {k: get_ith_value(v.copy()) for k, v in replay_trace.items()}
+
 
 def _subs_wrapper(subs_map, i, length, site):
     if site["type"] != "sample":
@@ -319,8 +324,10 @@ def scan_wrapper(
                     seeded_fn = handlers.replay(seeded_fn, trace=replay_trace_i)
 
             if replay_trace is not None:
-                seeded_fn_trace = handlers.trace(seeded_fn).get_trace(carry, x)
-                replay_trace_i = _replay_wrapper(replay_trace, seeded_fn_trace, i, length)
+                trace = handlers.trace(seeded_fn).get_trace(carry, x)
+                replay_trace_i = _replay_wrapper(
+                    replay_trace, trace, i - 1, length
+                )
                 seeded_fn = handlers.replay(seeded_fn, trace=replay_trace_i)
 
             with handlers.trace() as trace:
