@@ -155,7 +155,6 @@ class SteinVI:
         self.particle_transform_fn = None
         self.particle_transforms = None
 
-
     def _param_size(self, param):
         if isinstance(param, tuple) or isinstance(param, list):
             return sum(map(self._param_size, param))
@@ -341,6 +340,13 @@ class SteinVI:
         res_grads = tree_map(
             lambda x: -x, {**non_mixture_param_grads, **stein_param_grads}
         )
+
+        # Stein discrepancy
+        # TODO: compute $\nabla \phi^* $
+        sd = (
+            particle_grads * particle_ljp_grads
+        ).sum()  # tr(\phi^*(x) [(\nabla_x log p)(x)]^T)
+
         return jnp.linalg.norm(particle_grads), res_grads
 
     def init(self, rng_key, *args, **kwargs):

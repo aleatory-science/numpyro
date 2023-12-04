@@ -3,10 +3,12 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from functools import reduce
+from operator import mul
 
 import numpy as np
 
-from jax import numpy as jnp, random, grad
+from jax import grad, numpy as jnp, random
 from jax.lax import stop_gradient
 import jax.scipy.linalg
 from jax.scipy.special import logsumexp
@@ -14,7 +16,7 @@ import jax.scipy.stats
 
 from numpyro import prng_key
 from numpyro.contrib.einstein.stein_util import median_bandwidth
-from numpyro.distributions import biject_to
+from numpyro.distributions import Delta, biject_to
 from numpyro.handlers import replay, seed, substitute, trace
 from numpyro.infer.autoguide import AutoNormal
 from numpyro.infer.util import (
@@ -488,8 +490,6 @@ class ProductKernel(SteinKernel):
             ), trace() as ytr:
                 self.guide(*model_args, **model_kwargs)
 
-            check_model_guide_match(xtr, ytr)
-
             with replay(trace=xtr), substitute(data=y), trace() as tmpytr:
                 self.guide(*model_args, **model_kwargs)
 
@@ -542,10 +542,11 @@ class ProductKernel(SteinKernel):
             indep_plate_dims = {frame.dim for frame in indep_plates}
 
             kval = 0.0
+            norm = 0.0
             for site_name in xtr:
                 xsite = xtr[site_name]
                 ysite = ytr[site_name]
-                if xsite["type"] != "sample":
+                if xsite["type"] != "sample" or isinstance(xsite["fn"], Delta):
                     continue
                 lp = xsite["log_prob"] + ysite["log_prob"]
                 sq_axes = ()
@@ -556,9 +557,13 @@ class ProductKernel(SteinKernel):
                     lp = logsumexp(lp, axis=dim, keepdims=True)
                     sq_axes = sq_axes + (dim,)
 
+                if sq_axes:
+                    norm = norm + reduce(
+                        mul, (xsite["log_prob"].shape[ax] for ax in sq_axes)
+                    )
                 kval = kval + jnp.exp(jnp.squeeze(lp, sq_axes))
 
-            return self.scale * kval
+            return self.scale * kval / max(1.0, norm)
 
         return kernel
 

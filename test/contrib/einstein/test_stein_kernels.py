@@ -10,15 +10,21 @@ import pytest
 
 from jax import numpy as jnp, random
 
+from numpyro import prng_key, sample
 from numpyro.contrib.einstein import SteinVI
 from numpyro.contrib.einstein.stein_kernels import (
     GraphicalKernel,
     IMQKernel,
     LinearKernel,
     MixtureKernel,
+    ProductKernel,
     RandomFeatureKernel,
     RBFKernel,
 )
+from numpyro.contrib.einstein.stein_util import batch_ravel_pytree
+from numpyro.distributions import Normal
+from numpyro.handlers import seed, trace
+from numpyro.infer.autoguide import AutoDiagonalNormal
 from numpyro.optim import Adam
 
 T = namedtuple("TestSteinKernel", ["kernel", "particle_info", "loss_fn", "kval"])
@@ -109,3 +115,40 @@ def test_apply_kernel(
     if mode == "matrix":
         kval_[mode] = np.dot(kval_[mode], v)
     assert_allclose(value, kval_[mode], atol=1e-6)
+
+
+def test_prod_kernel_auto_diagonal():
+    def model():
+        sample(
+            "x",
+            Normal(
+                jnp.zeros(
+                    3,
+                )
+            ).to_event(1),
+        )
+
+    guide = AutoDiagonalNormal(model)
+
+    ps = {
+        "auto_loc": jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        "auto_scale": jnp.array([[0.1, 0.1, 0.1], [0.1, 0.1, 0.1]]),
+        "_auto_latent": jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        "x": jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+    }
+
+    stein_ps, unravel_pytree, unravel_pytree_batched = batch_ravel_pytree(
+        ps, nbatch_dims=1
+    )
+
+    kernel = ProductKernel(guide)
+    kernel.init(None, None, unravel_pytree)
+
+    kernel_fn = kernel.compute(None, None, None, (), {})
+
+    with seed(rng_seed=0):
+        kernel_val = kernel_fn(prng_key(), stein_ps[0], stein_ps[1])
+
+    expected = jnp.exp(2 * Normal(scale=0.1).log_prob(0.0))
+
+    assert_allclose(kernel_val, expected, atol=1e-6)
