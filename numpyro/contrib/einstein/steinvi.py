@@ -14,7 +14,7 @@ from jax.tree_util import tree_map
 
 from numpyro import handlers
 from numpyro.contrib.einstein.stein_kernels import SteinKernel
-from numpyro.contrib.einstein.stein_loss import SteinLoss
+from numpyro.contrib.einstein.stein_loss import NewSteinLoss
 from numpyro.contrib.einstein.stein_util import (
     batch_ravel_pytree,
     get_parameter_transform,
@@ -138,7 +138,7 @@ class SteinVI:
         self.guide = guide
         self._init_guide = deepcopy(guide)
         self.optim = optim
-        self.stein_loss = SteinLoss(  # TODO: @OlaRonning handle enum
+        self.stein_loss = NewSteinLoss(  # TODO: @OlaRonning handle enum
             elbo_num_particles=num_elbo_particles,
             stein_num_particles=num_stein_particles,
         )
@@ -242,35 +242,24 @@ class SteinVI:
         def kernel_particles_loss_fn(
             rng_key, particles
         ):  # TODO: rewrite using def to utilize jax caching
-            particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
             grads = vmap(
-                lambda i: grad(
-                    lambda particle: (
-                        vmap(
-                            lambda elbo_key: self.stein_loss.single_particle_loss(
-                                rng_key=elbo_key,
-                                model=handlers.scale(
-                                    self._inference_model, self.loss_temperature
-                                ),
-                                guide=self.guide,
-                                selected_particle=unravel_pytree(particle),
-                                unravel_pytree=unravel_pytree,
-                                flat_particles=particles,
-                                select_index=i,
-                                model_args=args,
-                                model_kwargs=kwargs,
-                                param_map=self.constrain_fn(non_mixture_uparams),
-                            )
-                        )(
-                            random.split(
-                                particle_keys[i], self.stein_loss.elbo_num_particles
-                            )
-                        )
-                    ).mean()
-                )(particles[i])
-            )(jnp.arange(self.stein_loss.stein_num_particles))
+                lambda key: grad(
+                    lambda ps: self.stein_loss.mixture_loss(
+                        rng_key=key,
+                        particles=ps,
+                        model=handlers.scale(
+                            self._inference_model, self.loss_temperature
+                        ),
+                        guide=self.guide,
+                        unravel_pytree=unravel_pytree,
+                        model_args=args,
+                        model_kwargs=kwargs,
+                        param_map=self.constrain_fn(non_mixture_uparams),
+                    )
+                )(particles)
+            )(random.split(rng_key, self.stein_loss.elbo_num_particles))
 
-            return grads
+            return grads.mean(0)  # check this is correct
 
         def particle_transform_fn(particle):
             params = unravel_pytree(particle)

@@ -10,6 +10,91 @@ from numpyro.infer.util import log_density
 from numpyro.util import _validate_model, check_model_guide_match
 
 
+class NewSteinLoss:
+    def __init__(self, elbo_num_particles=1, stein_num_particles=1):
+        self.elbo_num_particles = elbo_num_particles
+        self.stein_num_particles = stein_num_particles
+
+    def mixture_loss(
+        self,
+        rng_key,
+        particles,
+        model,
+        guide,
+        model_args,
+        model_kwargs,
+        unravel_pytree,
+        param_map,
+    ):
+        guide_key, model_key = random.split(rng_key, 2)
+        guide_keys = random.split(guide_key, self.stein_num_particles)
+        model_keys = random.split(model_key, self.stein_num_particles)
+
+        ps = vmap(unravel_pytree)(particles)
+
+        def comp_elbo(gkey, mkey, curr_par):
+            seeded_guide = seed(guide, gkey)
+            curr_lp, curr_gtr = log_density(
+                seeded_guide,
+                model_args,
+                model_kwargs,
+                {**param_map, **curr_par},
+            )
+
+            def clp_fn(cgkey, cpar):
+                clp, ctr = log_density(
+                    replay(seed(guide, cgkey), curr_gtr),
+                    model_args,
+                    model_kwargs,
+                    {**param_map, **cpar},
+                )
+                # Validate
+                check_model_guide_match(ctr, curr_gtr)
+                return clp
+
+            glp = logsumexp(vmap(clp_fn)(guide_keys, ps))
+
+            seeded_model = seed(model, mkey)
+            mlp, mtr = log_density(
+                replay(seeded_model, curr_gtr),
+                model_args,
+                model_kwargs,
+                {**param_map, **curr_par},
+            )
+
+            check_model_guide_match(mtr, curr_gtr)
+            _validate_model(mtr, plate_warning="loose")
+            comp_elbo = mlp - glp
+            return comp_elbo
+
+        return vmap(comp_elbo, out_axes=0)(guide_keys, model_keys, ps).mean(
+            0
+        )  # TODO: check sign of computation
+
+    def loss(self, rng_key, param_map, model, guide, particles, *args, **kwargs):
+        if not particles:
+            raise ValueError("Stein mixture undefined for empty guide.")
+
+        flat_particles, unravel_pytree, _ = batch_ravel_pytree(particles, nbatch_dims=1)
+
+        score_keys = random.split(rng_key, self.elbo_num_particles)
+
+        elbos = vmap(
+            lambda key: self.mixture_loss(
+                rng_key=key,
+                particles=flat_particles,
+                model=model,
+                guide=guide,
+                model_args=args,
+                model_kwargs=kwargs,
+                unravel_pytree=unravel_pytree,
+                param_map=param_map,
+            ),
+            out_axes=0,
+        )(score_keys)
+        return -elbos.mean()
+
+
 class SteinLoss:
     def __init__(self, elbo_num_particles=1, stein_num_particles=1):
         self.elbo_num_particles = elbo_num_particles
@@ -29,13 +114,12 @@ class SteinLoss:
         param_map,
     ):
         guide_key, model_key = random.split(rng_key, 2)
-
-        # 2. Draw from selected mixture component
         guide_keys = random.split(guide_key, self.stein_num_particles)
 
-        seeded_chosen = seed(guide, guide_keys[select_index])
-        log_chosen_density, chosen_trace = log_density(
-            seeded_chosen, model_args, model_kwargs, {**param_map, **selected_particle}
+        # 2. Draw from selected mixture component
+
+        log_guide_density = logsumexp(
+            vmap(log_component_density)(jnp.arange(self.stein_num_particles))
         )
 
         # 3. Score mixture guide
