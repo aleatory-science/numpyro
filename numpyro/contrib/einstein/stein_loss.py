@@ -34,7 +34,7 @@ class NewSteinLoss:
 
         def comp_elbo(gkey, mkey, curr_par):
             seeded_guide = seed(guide, gkey)
-            curr_lp, curr_gtr = log_density(
+            _, curr_gtr = log_density(
                 seeded_guide,
                 model_args,
                 model_kwargs,
@@ -52,7 +52,7 @@ class NewSteinLoss:
                 check_model_guide_match(ctr, curr_gtr)
                 return clp
 
-            glp = logsumexp(vmap(clp_fn)(guide_keys, ps))
+            glp = logsumexp(vmap(clp_fn)(guide_keys, ps)) - jnp.log(self.stein_num_particles)
 
             seeded_model = seed(model, mkey)
             mlp, mtr = log_density(
