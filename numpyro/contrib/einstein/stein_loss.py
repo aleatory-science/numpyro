@@ -5,7 +5,7 @@ from jax import numpy as jnp, random, vmap
 from jax.nn import logsumexp
 
 from numpyro.contrib.einstein.stein_util import batch_ravel_pytree
-from numpyro.handlers import replay, seed
+from numpyro.handlers import replay, seed, trace
 from numpyro.infer.util import log_density
 from numpyro.util import _validate_model, check_model_guide_match
 
@@ -33,7 +33,7 @@ class NewSteinLoss:
         ps = vmap(unravel_pytree)(particles)
 
         def comp_elbo(gkey, mkey, curr_par):
-            seeded_guide = seed(guide, gkey)
+            seeded_guide = seed(guide, gkey, hide_types=["plate"])
             _, curr_gtr = log_density(
                 seeded_guide,
                 model_args,
@@ -55,6 +55,10 @@ class NewSteinLoss:
             glp = logsumexp(vmap(clp_fn)(guide_keys, ps)) - jnp.log(self.stein_num_particles)
 
             seeded_model = seed(model, mkey)
+
+            corr_plates = {k: v for k,v in trace(seeded_model).get_trace(*model_args, **model_kwargs).items() if v['type'] == 'plate' and jnp.shape(v['value']) != jnp.shape(curr_gtr[k]['value'])}
+            curr_gtr.update(corr_plates)
+
             mlp, mtr = log_density(
                 replay(seeded_model, curr_gtr),
                 model_args,
@@ -94,7 +98,6 @@ class NewSteinLoss:
         )(score_keys)
         return -elbos.mean()
 
-
 class SteinLoss:
     def __init__(self, elbo_num_particles=1, stein_num_particles=1):
         self.elbo_num_particles = elbo_num_particles
@@ -114,12 +117,13 @@ class SteinLoss:
         param_map,
     ):
         guide_key, model_key = random.split(rng_key, 2)
-        guide_keys = random.split(guide_key, self.stein_num_particles)
 
         # 2. Draw from selected mixture component
+        guide_keys = random.split(guide_key, self.stein_num_particles)
 
-        log_guide_density = logsumexp(
-            vmap(log_component_density)(jnp.arange(self.stein_num_particles))
+        seeded_chosen = seed(guide, guide_keys[select_index])
+        log_chosen_density, chosen_trace = log_density(
+            seeded_chosen, model_args, model_kwargs, {**param_map, **selected_particle}
         )
 
         # 3. Score mixture guide
@@ -140,6 +144,9 @@ class SteinLoss:
 
         # 4. Score model
         seeded_model = seed(model, model_key)
+
+        corr_plates = {k: v for k,v in trace(seeded_model).get_trace(*model_args, **model_kwargs).items() if v['type'] == 'plate' and jnp.shape(v['value']) != jnp.shape(chosen_trace[k]['value'])}
+        chosen_trace.update(corr_plates)
         log_model_density, model_trace = log_density(
             replay(seeded_model, chosen_trace),
             model_args,
