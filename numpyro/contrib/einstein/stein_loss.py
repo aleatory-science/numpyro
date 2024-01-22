@@ -52,11 +52,20 @@ class NewSteinLoss:
                 check_model_guide_match(ctr, curr_gtr)
                 return clp
 
-            glp = logsumexp(vmap(clp_fn)(guide_keys, ps)) - jnp.log(self.stein_num_particles)
+            glp = logsumexp(vmap(clp_fn)(guide_keys, ps)) - jnp.log(
+                self.stein_num_particles
+            )
 
             seeded_model = seed(model, mkey)
 
-            corr_plates = {k: v for k,v in trace(seeded_model).get_trace(*model_args, **model_kwargs).items() if v['type'] == 'plate' and jnp.shape(v['value']) != jnp.shape(curr_gtr[k]['value'])}
+            corr_plates = {
+                k: v
+                for k, v in trace(seeded_model)
+                .get_trace(*model_args, **model_kwargs)
+                .items()
+                if v["type"] == "plate"
+                and jnp.shape(v["value"]) != jnp.shape(curr_gtr[k]["value"])
+            }
             curr_gtr.update(corr_plates)
 
             mlp, mtr = log_density(
@@ -97,6 +106,7 @@ class NewSteinLoss:
             out_axes=0,
         )(score_keys)
         return -elbos.mean()
+
 
 class SteinLoss:
     def __init__(self, elbo_num_particles=1, stein_num_particles=1):
@@ -145,7 +155,14 @@ class SteinLoss:
         # 4. Score model
         seeded_model = seed(model, model_key)
 
-        corr_plates = {k: v for k,v in trace(seeded_model).get_trace(*model_args, **model_kwargs).items() if v['type'] == 'plate' and jnp.shape(v['value']) != jnp.shape(chosen_trace[k]['value'])}
+        corr_plates = {
+            k: v
+            for k, v in trace(seeded_model)
+            .get_trace(*model_args, **model_kwargs)
+            .items()
+            if v["type"] == "plate"
+            and jnp.shape(v["value"]) != jnp.shape(chosen_trace[k]["value"])
+        }
         chosen_trace.update(corr_plates)
         log_model_density, model_trace = log_density(
             replay(seeded_model, chosen_trace),
