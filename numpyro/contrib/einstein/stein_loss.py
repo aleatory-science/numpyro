@@ -80,9 +80,7 @@ class NewSteinLoss:
             comp_elbo = mlp - glp
             return comp_elbo
 
-        return vmap(comp_elbo, out_axes=0)(guide_keys, model_keys, ps).mean(
-            0
-        )  # TODO: check sign of computation
+        return vmap(comp_elbo, out_axes=0)(guide_keys, model_keys, ps)
 
     def loss(self, rng_key, param_map, model, guide, particles, *args, **kwargs):
         if not particles:
@@ -105,7 +103,7 @@ class NewSteinLoss:
             ),
             out_axes=0,
         )(score_keys)
-        return -elbos.mean()
+        return -elbos
 
 
 class SteinLoss:

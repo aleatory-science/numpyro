@@ -231,7 +231,7 @@ class SteinVI:
                         model_args=args,
                         model_kwargs=kwargs,
                         param_map=self.constrain_fn(non_mixture_uparams),
-                    )
+                    ).mean(0)
                 )(particles)
             )(random.split(rng_key, self.stein_loss.elbo_num_particles))
 
@@ -264,7 +264,7 @@ class SteinVI:
                 unravel_pytree_batched(ctstein_particles),
                 *args,
                 **kwargs,
-            )
+            ).mean()
         )(non_mixture_uparams)
 
         # 3. Calculate kernel of particles
