@@ -9,7 +9,7 @@ from functools import partial
 from itertools import chain
 import operator
 
-from jax import grad, jacfwd, numpy as jnp, random, vmap
+from jax import grad, jacfwd, numpy as jnp, random, vmap, jacrev
 from jax.tree_util import tree_map
 
 from numpyro import handlers
@@ -243,7 +243,7 @@ class SteinVI:
             rng_key, particles
         ):  # TODO: rewrite using def to utilize jax caching
             grads = vmap(
-                lambda key: grad(
+                lambda key: jacrev(
                     lambda ps: self.stein_loss.mixture_loss(
                         rng_key=key,
                         particles=ps,
@@ -256,7 +256,7 @@ class SteinVI:
                         model_kwargs=kwargs,
                         param_map=self.constrain_fn(non_mixture_uparams),
                     )
-                )(particles)
+                )(particles).sum(0)
             )(random.split(rng_key, self.stein_loss.elbo_num_particles))
 
             return grads.mean(0)  # check this is correct
@@ -288,7 +288,7 @@ class SteinVI:
                 unravel_pytree_batched(ctstein_particles),
                 *args,
                 **kwargs,
-            )
+            ).mean()
         )(non_mixture_uparams)
 
         # 3. Calculate kernel of particles

@@ -28,11 +28,10 @@ class NewSteinLoss:
     ):
         guide_key, model_key = random.split(rng_key, 2)
         guide_keys = random.split(guide_key, self.stein_num_particles)
-        model_keys = random.split(model_key, self.stein_num_particles)
 
         ps = vmap(unravel_pytree)(particles)
 
-        def comp_elbo(gkey, mkey, curr_par):
+        def comp_elbo(gkey, curr_par):
             seeded_guide = seed(guide, gkey)
             curr_lp, curr_gtr = log_density(
                 seeded_guide,
@@ -41,9 +40,9 @@ class NewSteinLoss:
                 {**param_map, **curr_par},
             )
 
-            def clp_fn(cgkey, cpar):
+            def clp_fn(cpar):
                 clp, ctr = log_density(
-                    replay(seed(guide, cgkey), curr_gtr),
+                    replay(guide, curr_gtr),
                     model_args,
                     model_kwargs,
                     {**param_map, **cpar},
@@ -52,9 +51,9 @@ class NewSteinLoss:
                 check_model_guide_match(ctr, curr_gtr)
                 return clp
 
-            glp = logsumexp(vmap(clp_fn)(guide_keys, ps))
+            glp = logsumexp(vmap(clp_fn)(ps)) - jnp.log(self.stein_num_particles)
 
-            seeded_model = seed(model, mkey)
+            seeded_model = seed(model, model_key)
             mlp, mtr = log_density(
                 replay(seeded_model, curr_gtr),
                 model_args,
@@ -67,9 +66,7 @@ class NewSteinLoss:
             comp_elbo = mlp - glp
             return comp_elbo
 
-        return vmap(comp_elbo, out_axes=0)(guide_keys, model_keys, ps).mean(
-            0
-        )  # TODO: check sign of computation
+        return vmap(comp_elbo, out_axes=0)(guide_keys, ps)
 
     def loss(self, rng_key, param_map, model, guide, particles, *args, **kwargs):
         if not particles:
@@ -92,7 +89,7 @@ class NewSteinLoss:
             ),
             out_axes=0,
         )(score_keys)
-        return -elbos.mean()
+        return -elbos.mean(0)
 
 
 class SteinLoss:
