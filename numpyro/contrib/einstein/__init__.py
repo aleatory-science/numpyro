@@ -11,12 +11,10 @@ from numpyro.contrib.einstein.stein_kernels import (
     RandomFeatureKernel,
     RBFKernel,
 )
-from numpyro.contrib.einstein.stein_loss import SteinLoss
 from numpyro.contrib.einstein.steinvi import SteinVI
 
 __all__ = [
     "SteinVI",
-    "SteinLoss",
     "RBFKernel",
     "IMQKernel",
     "LinearKernel",

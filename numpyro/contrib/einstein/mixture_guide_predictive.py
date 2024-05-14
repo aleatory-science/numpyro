@@ -5,8 +5,8 @@ from collections.abc import Callable, Sequence
 from functools import partial
 from typing import Optional
 
-from jax import numpy as jnp, random, vmap
-from jax.tree_util import tree_flatten, tree_map
+from jax import numpy as jnp, random, tree_map, vmap
+from jax.tree_util import tree_flatten
 
 from numpyro.handlers import substitute
 from numpyro.infer import Predictive
@@ -118,6 +118,6 @@ class MixtureGuidePredictive:
 
         return {
             self.mixture_assignment_sitename: assigns,
-            **samples_guide,
-            **samples_model,  # use samples from model if site in model and guide
+            **samples_guide, 
+            **samples_model, 
         }

@@ -9,7 +9,7 @@ from functools import partial
 from itertools import chain
 import operator
 
-from jax import grad, jacfwd, numpy as jnp, random, vmap
+from jax import grad, jacfwd, numpy as jnp, random, vmap, jacrev
 from jax.tree_util import tree_map
 
 from numpyro import handlers
@@ -138,7 +138,7 @@ class SteinVI:
         self.guide = guide
         self._init_guide = deepcopy(guide)
         self.optim = optim
-        self.stein_loss = SteinLoss(  # TODO: @OlaRonning handle enum
+        self.stein_loss = NewSteinLoss(  # TODO: @OlaRonning handle enum
             elbo_num_particles=num_elbo_particles,
             stein_num_particles=num_stein_particles,
         )
@@ -217,11 +217,13 @@ class SteinVI:
 
     def _svgd_loss_and_grads(self, rng_key, unconstr_params, *args, **kwargs):
         # 0. Separate model and guide parameters, since only guide parameters are updated using Stein
-        non_mixture_uparams = {  # Includes any marked guide parameters and all model parameters
-            p: v
-            for p, v in unconstr_params.items()
-            if p not in self.guide_sites or self.non_mixture_params_fn(p)
-        }
+        non_mixture_uparams = (
+            {  # Includes any marked guide parameters and all model parameters
+                p: v
+                for p, v in unconstr_params.items()
+                if p not in self.guide_sites or self.non_mixture_params_fn(p)
+            }
+        )
         stein_uparams = {
             p: v for p, v in unconstr_params.items() if p not in non_mixture_uparams
         }
@@ -239,34 +241,21 @@ class SteinVI:
         # 2. Calculate gradients for each particle
         def kernel_particles_loss_fn(
             rng_key, particles
-        ):  # TODO: rewrite using def to utilize jax caching
-            particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
-            grads = vmap(
-                lambda i: grad(
-                    lambda particle: (
-                        vmap(
-                            lambda elbo_key: self.stein_loss.single_particle_loss(
-                                rng_key=elbo_key,
-                                model=handlers.scale(
-                                    self._inference_model, self.loss_temperature
-                                ),
-                                guide=self.guide,
-                                selected_particle=unravel_pytree(particle),
-                                unravel_pytree=unravel_pytree,
-                                flat_particles=particles,
-                                select_index=i,
-                                model_args=args,
-                                model_kwargs=kwargs,
-                                param_map=self.constrain_fn(non_mixture_uparams),
-                            )
-                        )(
-                            random.split(
-                                particle_keys[i], self.stein_loss.elbo_num_particles
-                            )
-                        )
-                    ).mean()
-                )(particles[i])
-            )(jnp.arange(self.stein_loss.stein_num_particles))
+        ): 
+            grads = grad(lambda ps:
+                    vmap(lambda key: 
+                        self.stein_loss.mixture_loss(
+                        rng_key=key,
+                        particles=vmap(particle_transform_fn)(ps)[1],
+                        model=handlers.scale(
+                            self._inference_model, self.loss_temperature
+                        ),
+                        guide=self.guide,
+                        unravel_pytree=unravel_pytree,
+                        model_args=args,
+                        model_kwargs=kwargs,
+                        param_map=self.constrain_fn(non_mixture_uparams),
+                    ))(random.split(rng_key, self.stein_loss.elbo_num_particles)).mean(0).sum())(particles)
 
             return grads
 
@@ -279,25 +268,20 @@ class SteinVI:
             ctparticle, _ = ravel_pytree(ctparams)
             return tparticle, ctparticle
 
-        # 2.1 Lift particles to constraint space
-        tstein_particles, ctstein_particles = vmap(particle_transform_fn)(
-            stein_particles
-        )
-
         # 2.2 Compute particle gradients (for attractive force)
-        particle_ljp_grads = kernel_particles_loss_fn(attractive_key, ctstein_particles)
+        particle_ljp_grads = kernel_particles_loss_fn(attractive_key, stein_particles)
 
         # 2.2 Compute non-mixture parameter gradients
         non_mixture_param_grads = grad(
-            lambda cps: -self.stein_loss.loss(
+            lambda cps: self.stein_loss.loss(
                 classic_key,
                 self.constrain_fn(cps),
                 handlers.scale(self._inference_model, self.loss_temperature),
                 self.guide,
-                unravel_pytree_batched(ctstein_particles),
+                unravel_pytree_batched(vmap(particle_transform_fn)(stein_particles)[1]),
                 *args,
                 **kwargs,
-            )
+            ).mean()
         )(non_mixture_uparams)
 
         # 3. Calculate kernel of particles
@@ -310,19 +294,20 @@ class SteinVI:
             lambda y: jnp.sum(
                 vmap(
                     lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad)
-                )(tstein_particles, particle_ljp_grads),
+                )(stein_particles, particle_ljp_grads),
                 axis=0,
             )
-        )(tstein_particles)
+        )(stein_particles)
+
         repulsive_force = vmap(
-            lambda y: jnp.sum(
+            lambda y: jnp.mean(
                 vmap(
                     lambda x: self.repulsion_temperature
                     * self._kernel_grad(kernel, x, y)
-                )(tstein_particles),
+                )(stein_particles),
                 axis=0,
             )
-        )(tstein_particles)
+        )(stein_particles)
 
         def single_particle_grad(particle, attr_forces, rep_forces):
             def _nontrivial_jac(var_name, var):
@@ -351,12 +336,7 @@ class SteinVI:
             jac_particle, _ = ravel_pytree(jac_params)
             return jac_particle
 
-        particle_grads = (
-            vmap(single_particle_grad)(
-                stein_particles, attractive_force, repulsive_force
-            )
-            / self.num_stein_particles
-        )
+        particle_grads = attractive_force + repulsive_force
 
         # 5. Decompose the monolithic particle forces back to concrete parameter values
         stein_param_grads = unravel_pytree_batched(particle_grads)
