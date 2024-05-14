@@ -76,7 +76,7 @@ class SteinLoss:
             comp_elbo = mlp - glp
             return comp_elbo
 
-        return vmap(comp_elbo, out_axes=0)(guide_keys, ps)
+        return vmap(comp_elbo, out_axes=0)(guide_keys, ps).mean()
 
     def loss(self, rng_key, param_map, model, guide, particles, *args, **kwargs):
         if not particles:
@@ -99,4 +99,4 @@ class SteinLoss:
             ),
             out_axes=0,
         )(score_keys)
-        return elbos.mean(0)
+        return -elbos.mean(0)

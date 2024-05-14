@@ -4,7 +4,7 @@
 from numpy.testing import assert_allclose
 from pytest import fail
 
-from jax import numpy as jnp, random, value_and_grad
+from jax import numpy as jnp, random, value_and_grad, grad, jacrev
 
 import numpyro
 from numpyro.contrib.einstein.stein_loss import SteinLoss
@@ -55,43 +55,43 @@ def test_stein_elbo():
 
 def test_stein_particle_loss():
     def model(x):
-        numpyro.sample("x", dist.Normal(0, 1))
-        numpyro.sample("obs", dist.Normal(0, 1), obs=x)
+        z = numpyro.sample("z", dist.Normal(0, 1))
+        numpyro.sample("obs", dist.Normal(z, 1), obs=x)
 
     def guide(x):
-        numpyro.sample("x", dist.Normal(0, 1))
+        z_param = numpyro.param('z_param', 0.)
+        z = numpyro.sample("z", dist.Normal(z_param, 1))
+        assert z.shape == ()
 
-    def stein_loss_fn(x, particles, chosen_particle, assign):
+    def stein_loss_fn(particles):
         return SteinLoss(
             elbo_num_particles=1, stein_num_particles=3
-        ).single_particle_loss(
+        ).mixture_loss(
             random.PRNGKey(0),
+            particles,
             model,
             guide,
-            chosen_particle,
+            (2.,),
+            {},
             unravel_pytree,
-            particles,
-            assign,
-            (x,),
-            {},
-            {},
+            {'z': jnp.array(1.)},
         )
 
-    xs = jnp.array([-1, 0.5, 3.0])
-    num_particles = xs.shape[0]
-    particles = {"x": xs}
+    zs = jnp.array([-1, 0.5, 3.0])
+    num_particles = zs.shape[0]
+    particles = {"z_param": zs}
 
     flat_particles, unravel_pytree, _ = batch_ravel_pytree(particles, nbatch_dims=1)
-    losses, grads = [], []
-    for i in range(num_particles):
-        chosen_particle = unravel_pytree(flat_particles[i])
-        loss, grad = value_and_grad(stein_loss_fn)(
-            2.0, flat_particles, chosen_particle, i
-        )
-        losses.append(loss)
-        grads.append(grad)
+    loss = stein_loss_fn(flat_particles)
 
-    assert jnp.abs(losses[0] - losses[1]) > 0.1
-    assert jnp.abs(losses[1] - losses[2]) > 0.1
-    assert_allclose(grads[0], grads[1])
-    assert_allclose(grads[1], grads[2])
+    # let t=1 in 1/3 \sum_i=1^3  \log {N(2|t, 1) N(t|0,1)/ [(1/3) N(t|-1, 1) + N(t|0.5, 1) + N(t|3,1)]}
+    expected_loss = (dist.Normal().log_prob(1.) + dist.Normal(1.).log_prob(2.)  # joint log density of model
+                     + jnp.log(3.) - jnp.log(jnp.exp(dist.Normal(zs).log_prob(jnp.ones_like(zs))).sum())) # log density of guides
+
+    assert_allclose(loss, expected_loss)
+
+    grads = grad(lambda ps: stein_loss_fn(ps))(flat_particles).squeeze()
+
+    qs_sum, grads_loc = value_and_grad(lambda zs: jnp.exp(dist.Normal(zs).log_prob(jnp.ones_like(zs))).sum())(zs)
+    expected_grads = - grads_loc / qs_sum
+    assert_allclose(expected_grads, grads)  # NOTE: This does not account for gradient wrt. expect prob.

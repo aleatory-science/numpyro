@@ -138,7 +138,7 @@ class SteinVI:
         self.guide = guide
         self._init_guide = deepcopy(guide)
         self.optim = optim
-        self.stein_loss = NewSteinLoss(  # TODO: @OlaRonning handle enum
+        self.stein_loss = SteinLoss(  # TODO: @OlaRonning handle enum
             elbo_num_particles=num_elbo_particles,
             stein_num_particles=num_stein_particles,
         )
@@ -239,12 +239,12 @@ class SteinVI:
         attractive_key, classic_key = random.split(rng_key)
 
         # 2. Calculate gradients for each particle
-        def kernel_particles_loss_fn(
+        def particle_score(
             rng_key, particles
         ): 
             grads = grad(lambda ps:
                     vmap(lambda key: 
-                        self.stein_loss.mixture_loss(
+                        self.num_stein_particles * self.stein_loss.mixture_loss(
                         rng_key=key,
                         particles=vmap(particle_transform_fn)(ps)[1],
                         model=handlers.scale(
@@ -255,8 +255,8 @@ class SteinVI:
                         model_args=args,
                         model_kwargs=kwargs,
                         param_map=self.constrain_fn(non_mixture_uparams),
-                    ))(random.split(rng_key, self.stein_loss.elbo_num_particles)).mean(0).sum())(particles)
-
+                    ))(random.split(rng_key, self.stein_loss.elbo_num_particles)).mean(0))(particles)
+                    # TODO: this is missing a term!
             return grads
 
         def particle_transform_fn(particle):
@@ -269,7 +269,7 @@ class SteinVI:
             return tparticle, ctparticle
 
         # 2.2 Compute particle gradients (for attractive force)
-        particle_ljp_grads = kernel_particles_loss_fn(attractive_key, stein_particles)
+        particle_ljp_grads = particle_score(attractive_key, stein_particles)
 
         # 2.2 Compute non-mixture parameter gradients
         non_mixture_param_grads = grad(
