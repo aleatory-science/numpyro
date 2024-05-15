@@ -239,10 +239,10 @@ class SteinVI:
         attractive_key, classic_key = random.split(rng_key)
 
         # 2. Calculate gradients for each particle
-        def particle_score(
+        def particle_scores(
             rng_key, particles
         ): 
-            grads = grad(lambda ps:
+            q_grads = grad(lambda ps:
                     vmap(lambda key: 
                         self.num_stein_particles * self.stein_loss.mixture_loss(
                         rng_key=key,
@@ -255,9 +255,9 @@ class SteinVI:
                         model_args=args,
                         model_kwargs=kwargs,
                         param_map=self.constrain_fn(non_mixture_uparams),
-                    ))(random.split(rng_key, self.stein_loss.elbo_num_particles)).mean(0))(particles)
+                    ))(random.split(rng_key, self.stein_loss.elbo_num_particles)).mean(0).mean())(particles)
                     # TODO: this is missing a term!
-            return grads
+            return self.num_stein_particles * q_grads
 
         def particle_transform_fn(particle):
             params = unravel_pytree(particle)
@@ -269,7 +269,7 @@ class SteinVI:
             return tparticle, ctparticle
 
         # 2.2 Compute particle gradients (for attractive force)
-        particle_ljp_grads = particle_score(attractive_key, stein_particles)
+        particle_ljp_grads = particle_scores(attractive_key, stein_particles)
 
         # 2.2 Compute non-mixture parameter gradients
         non_mixture_param_grads = grad(
@@ -286,7 +286,7 @@ class SteinVI:
 
         # 3. Calculate kernel of particles
         kernel = self.kernel_fn.compute(
-            stein_particles, particle_info, kernel_particles_loss_fn
+            stein_particles, particle_info, particle_scores
         )
 
         # 4. Calculate the attractive force and repulsive force on the particles

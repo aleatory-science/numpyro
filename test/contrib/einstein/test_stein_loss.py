@@ -4,7 +4,7 @@
 from numpy.testing import assert_allclose
 from pytest import fail
 
-from jax import numpy as jnp, random, value_and_grad, grad, jacrev
+from jax import numpy as jnp, random, value_and_grad, grad, jacrev, disable_jit, vmap
 
 import numpyro
 from numpyro.contrib.einstein.stein_loss import SteinLoss
@@ -71,27 +71,39 @@ def test_stein_particle_loss():
             particles,
             model,
             guide,
-            (2.,),
+            (4.,),
             {},
             unravel_pytree,
-            {'z': jnp.array(1.)},
-        )
+            {},
+        ).mean()
 
-    zs = jnp.array([-1, 0.5, 3.0])
-    num_particles = zs.shape[0]
-    particles = {"z_param": zs}
+    zps = jnp.array([-1, 0.5, 3.0])
+    num_particles = 3
+    particles = {"z_param": zps}
 
     flat_particles, unravel_pytree, _ = batch_ravel_pytree(particles, nbatch_dims=1)
-    loss = stein_loss_fn(flat_particles)
 
-    # let t=1 in 1/3 \sum_i=1^3  \log {N(2|t, 1) N(t|0,1)/ [(1/3) N(t|-1, 1) + N(t|0.5, 1) + N(t|3,1)]}
-    expected_loss = (dist.Normal().log_prob(1.) + dist.Normal(1.).log_prob(2.)  # joint log density of model
-                     + jnp.log(3.) - jnp.log(jnp.exp(dist.Normal(zs).log_prob(jnp.ones_like(zs))).sum())) # log density of guides
+    act_loss = stein_loss_fn(flat_particles)
 
-    assert_allclose(loss, expected_loss)
+    # Manually compute the stein loss
+    z = jnp.array([0.1605581, 1.4552722, 1.2301822])  # From inpected traces 
+    exp_prior_loss = dist.Normal().log_prob(z)
+    exp_like_loss = dist.Normal(z).log_prob(4.)
+    exp_guide_loss = jnp.log(jnp.exp(dist.Normal(zps).log_prob(z[0][None])) 
+                             + jnp.exp(dist.Normal(zps).log_prob(z[1][None])) 
+                             + jnp.exp(dist.Normal(zps).log_prob(z[2][None])))
+    exp_loss = exp_prior_loss + exp_like_loss - exp_guide_loss + jnp.log(num_particles)
 
-    grads = grad(lambda ps: stein_loss_fn(ps))(flat_particles).squeeze()
+    
+    assert_allclose(act_loss, exp_loss.mean())  # True
 
-    qs_sum, grads_loc = value_and_grad(lambda zs: jnp.exp(dist.Normal(zs).log_prob(jnp.ones_like(zs))).sum())(zs)
-    expected_grads = - grads_loc / qs_sum
-    assert_allclose(expected_grads, grads)  # NOTE: This does not account for gradient wrt. expect prob.
+    act_grads = num_particles * grad(stein_loss_fn)(flat_particles).squeeze()
+
+    exp_grad_model_term = grad(lambda locs: dist.Normal(locs).log_prob(z).sum())(zps)  * exp_loss  # first term in eq. 8
+    exp_grad_guide_term = (vmap(lambda x: vmap(grad(lambda loc: jnp.exp(dist.Normal(loc).log_prob(x))))(zps))(z) /  jnp.stack([jnp.exp(dist.Normal(zps).log_prob(z[0][None])).sum(),
+        jnp.exp(dist.Normal(zps).log_prob(z[1][None])).sum() ,
+        jnp.exp(dist.Normal(zps).log_prob(z[2][None])).sum()])[None]).sum(1)  # second term in eq. 8
+
+    exp_grads = exp_grad_model_term - exp_grad_guide_term
+
+    assert_allclose(exp_grads, act_grads)  # False

@@ -31,27 +31,27 @@ class SteinLoss:
 
         ps = vmap(unravel_pytree)(particles)
 
-        def comp_elbo(gkey, curr_par):
+        def comp_elbo(gkey, par_i):
             seeded_guide = seed(guide, gkey)
-            curr_lp, curr_gtr = log_density(
+            curr_lp, gtr_i = log_density(
                 seeded_guide,
                 model_args,
                 model_kwargs,
-                {**param_map, **curr_par},
+                {**param_map, **par_i},
             )
 
-            def clp_fn(cpar):
+            def clp_fn(par_j):
                 clp, ctr = log_density(
-                    replay(guide, curr_gtr),
+                    replay(guide, gtr_i),
                     model_args,
                     model_kwargs,
-                    {**param_map, **cpar},
+                    {**param_map, **par_j},
                 )
                 # Validate
-                check_model_guide_match(ctr, curr_gtr)
+                check_model_guide_match(ctr, gtr_i)
                 return clp
 
-            glp = logsumexp(vmap(clp_fn)(ps)) - jnp.log(self.stein_num_particles)
+            glp = vmap(clp_fn)(ps) # computes q(theta_i| phi_j)
 
             seeded_model = seed(model, model_key)
             corr_plates = {
@@ -60,23 +60,25 @@ class SteinLoss:
                 .get_trace(*model_args, **model_kwargs)
                 .items()
                 if v["type"] == "plate"
-                if jnp.shape(v["value"]) != jnp.shape(curr_gtr[k]["value"])
+                if jnp.shape(v["value"]) != jnp.shape(gtr_i[k]["value"])
             }
-            curr_gtr.update(corr_plates)
+            gtr_i.update(corr_plates)
 
             mlp, mtr = log_density(
-                replay(seeded_model, curr_gtr),
+                replay(seeded_model, gtr_i),
                 model_args,
                 model_kwargs,
-                {**param_map, **curr_par},
+                {**param_map, **par_i},
             )
 
-            check_model_guide_match(mtr, curr_gtr)
+            check_model_guide_match(mtr, gtr_i)
             _validate_model(mtr, plate_warning="loose")
-            comp_elbo = mlp - glp
-            return comp_elbo
+            return mlp, glp 
 
-        return vmap(comp_elbo, out_axes=0)(guide_keys, ps).mean()
+        mlps, glps = vmap(comp_elbo)(guide_keys, ps)
+
+        return mlps - (logsumexp(glps, axis=0) - jnp.log(self.stein_num_particles))
+
 
     def loss(self, rng_key, param_map, model, guide, particles, *args, **kwargs):
         if not particles:
