@@ -8,6 +8,7 @@ import functools
 from functools import partial
 from itertools import chain
 import operator
+import numpy as np
 
 from jax import grad, jacfwd, numpy as jnp, random, vmap, jacrev
 from jax.tree_util import tree_map
@@ -242,11 +243,10 @@ class SteinVI:
         def particle_scores(
             rng_key, particles
         ): 
-            q_grads = grad(lambda ps:
-                    vmap(lambda key: 
-                        self.num_stein_particles * self.stein_loss.mixture_loss(
+            grads = vmap(lambda particle, key: self.stein_loss.particle_score(
                         rng_key=key,
-                        particles=vmap(particle_transform_fn)(ps)[1],
+                        particle=particle,
+                        particles=vmap(particle_transform_fn)(particles)[1],
                         model=handlers.scale(
                             self._inference_model, self.loss_temperature
                         ),
@@ -255,9 +255,9 @@ class SteinVI:
                         model_args=args,
                         model_kwargs=kwargs,
                         param_map=self.constrain_fn(non_mixture_uparams),
-                    ))(random.split(rng_key, self.stein_loss.elbo_num_particles)).mean(0).mean())(particles)
-                    # TODO: this is missing a term!
-            return self.num_stein_particles * q_grads
+                    ))(vmap(particle_transform_fn)(particles)[1], random.split(rng_key, self.num_stein_particles))
+
+            return grads
 
         def particle_transform_fn(particle):
             params = unravel_pytree(particle)
