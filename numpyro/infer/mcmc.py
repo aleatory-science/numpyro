@@ -444,8 +444,8 @@ class MCMC(object):
             )
             init_state = new_init_state if init_state is None else init_state
         sample_fn, postprocess_fn = self._get_cached_fns()
-        diagnostics = (  # noqa: E731
-            lambda x: self.sampler.get_diagnostics_str(x[0])
+        diagnostics = lambda x: (  # noqa: E731
+            self.sampler.get_diagnostics_str(x[0])
             if is_prng_key(rng_key) or self.sampler.is_ensemble_kernel
             else ""
         )

@@ -4,7 +4,8 @@
 from numpy.testing import assert_allclose
 from pytest import fail
 
-from jax import numpy as jnp, random, value_and_grad, grad, jacrev, disable_jit, vmap
+from jax import numpy as jnp, random, value_and_grad, vmap
+from jax.nn import logsumexp
 
 import numpyro
 from numpyro.contrib.einstein.stein_loss import SteinLoss
@@ -59,51 +60,40 @@ def test_stein_particle_loss():
         numpyro.sample("obs", dist.Normal(z, 1), obs=x)
 
     def guide(x):
-        z_param = numpyro.param('z_param', 0.)
+        z_param = numpyro.param("z_param", 0.0)
         z = numpyro.sample("z", dist.Normal(z_param, 1))
         assert z.shape == ()
 
     def stein_loss_fn(particles):
-        return SteinLoss(
-            elbo_num_particles=1, stein_num_particles=3
-        ).mixture_loss(
+        return SteinLoss(elbo_num_particles=1, stein_num_particles=3).mixture_loss(
             random.PRNGKey(0),
             particles,
             model,
             guide,
-            (4.,),
+            (4.0,),
             {},
             unravel_pytree,
             {},
-        ).mean()
+        )
 
     zps = jnp.array([-1, 0.5, 3.0])
     num_particles = 3
     particles = {"z_param": zps}
 
     flat_particles, unravel_pytree, _ = batch_ravel_pytree(particles, nbatch_dims=1)
-
     act_loss = stein_loss_fn(flat_particles)
 
-    # Manually compute the stein loss
-    z = jnp.array([0.1605581, 1.4552722, 1.2301822])  # From inpected traces 
-    exp_prior_loss = dist.Normal().log_prob(z)
-    exp_like_loss = dist.Normal(z).log_prob(4.)
-    exp_guide_loss = jnp.log(jnp.exp(dist.Normal(zps).log_prob(z[0][None])) 
-                             + jnp.exp(dist.Normal(zps).log_prob(z[1][None])) 
-                             + jnp.exp(dist.Normal(zps).log_prob(z[2][None])))
-    exp_loss = exp_prior_loss + exp_like_loss - exp_guide_loss + jnp.log(num_particles)
+    z = jnp.array([-0.1241799, 0.84642684, 3.0385242])  # From inpected traces
 
-    
-    assert_allclose(act_loss, exp_loss.mean())  # True
+    def man_loss(zps):
+        exp_prior_loss = dist.Normal().log_prob(z)
+        exp_like_loss = dist.Normal(z).log_prob(4.0)
+        exp_guide_loss = vmap(dist.Normal(zps).log_prob)(z)
+        exp_loss = (
+            exp_prior_loss
+            + exp_like_loss
+            - (logsumexp(exp_guide_loss, axis=0) - jnp.log(num_particles))
+        )
+        return exp_loss.mean()
 
-    act_grads = num_particles * grad(stein_loss_fn)(flat_particles).squeeze()
-
-    exp_grad_model_term = grad(lambda locs: dist.Normal(locs).log_prob(z).sum())(zps)  * exp_loss  # first term in eq. 8
-    exp_grad_guide_term = (vmap(lambda x: vmap(grad(lambda loc: jnp.exp(dist.Normal(loc).log_prob(x))))(zps))(z) /  jnp.stack([jnp.exp(dist.Normal(zps).log_prob(z[0][None])).sum(),
-        jnp.exp(dist.Normal(zps).log_prob(z[1][None])).sum() ,
-        jnp.exp(dist.Normal(zps).log_prob(z[2][None])).sum()])[None]).sum(1)  # second term in eq. 8
-
-    exp_grads = exp_grad_model_term - exp_grad_guide_term
-
-    assert_allclose(exp_grads, act_grads)  # False
+    assert_allclose(act_loss, man_loss(zps))

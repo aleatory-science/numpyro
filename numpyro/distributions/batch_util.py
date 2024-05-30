@@ -201,9 +201,9 @@ def _vmap_over_gaussian_copula(
     dist_axes.base_dist = vmap_over(
         dist.base_dist,
         loc=correlation_matrix if correlation_matrix == 0 else correlation_cholesky,
-        scale_tril=correlation_matrix
-        if correlation_matrix == 0
-        else correlation_cholesky,
+        scale_tril=(
+            correlation_matrix if correlation_matrix == 0 else correlation_cholesky
+        ),
         covariance_matrix=correlation_matrix,
     )
     return dist_axes

@@ -148,9 +148,11 @@ def run_inference(model, at_bats, hits, rng_key, args):
         num_warmup=args.num_warmup,
         num_samples=args.num_samples,
         num_chains=args.num_chains,
-        progress_bar=False
-        if ("NUMPYRO_SPHINXBUILD" in os.environ or args.disable_progbar)
-        else True,
+        progress_bar=(
+            False
+            if ("NUMPYRO_SPHINXBUILD" in os.environ or args.disable_progbar)
+            else True
+        ),
     )
     mcmc.run(rng_key, at_bats, hits)
     return mcmc.get_samples()

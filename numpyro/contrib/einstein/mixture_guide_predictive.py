@@ -118,6 +118,6 @@ class MixtureGuidePredictive:
 
         return {
             self.mixture_assignment_sitename: assigns,
-            **samples_guide, 
-            **samples_model, 
+            **samples_guide,
+            **samples_model,
         }

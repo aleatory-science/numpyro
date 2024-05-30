@@ -416,9 +416,11 @@ def load_dataset(
     def get_batch(i=0, idxs=idxs):
         ret_idx = lax.dynamic_slice_in_dim(idxs, i * batch_size, batch_size)
         return tuple(
-            np.take(a, ret_idx, axis=0)
-            if isinstance(a, list)
-            else lax.index_take(a, (ret_idx,), axes=(0,))
+            (
+                np.take(a, ret_idx, axis=0)
+                if isinstance(a, list)
+                else lax.index_take(a, (ret_idx,), axes=(0,))
+            )
             for a in arrays
         )
 

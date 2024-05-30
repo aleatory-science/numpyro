@@ -537,9 +537,11 @@ class ESS(EnsembleSampler):
 
         # XXX hack -- we don't know num_chains until we init the inner state
         self._moves = [
-            move(self._num_chains)
-            if move.__name__ == "make_differential_move"
-            else move
+            (
+                move(self._num_chains)
+                if move.__name__ == "make_differential_move"
+                else move
+            )
             for move in self._moves
         ]
 
