@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from jax import random
+from jax import random, hessian, vmap
 from jax.lax import stop_gradient
 import jax.numpy as jnp
 import jax.scipy.linalg
@@ -15,6 +15,7 @@ import jax.scipy.stats
 from numpyro.contrib.einstein.stein_util import median_bandwidth
 from numpyro.distributions import biject_to
 from numpyro.infer.autoguide import AutoNormal
+from numpyro import prng_key
 
 
 class SteinKernel(ABC):
@@ -29,6 +30,7 @@ class SteinKernel(ABC):
     @abstractmethod
     def compute(
         self,
+        rng_key,
         particles: jnp.ndarray,
         particle_info: dict[str, tuple[int, int]],
         loss_fn: Callable[[jnp.ndarray], float],
@@ -92,7 +94,7 @@ class RBFKernel(SteinKernel):
             self.mode == "matrix" and self.matrix_mode == "norm_diag"
         )
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(self, rng_key, particles, particle_info, loss_fn):
         bandwidth = median_bandwidth(particles, self.bandwidth_factor)
 
         def kernel(x, y):
@@ -112,6 +114,33 @@ class RBFKernel(SteinKernel):
     def mode(self):
         return self._mode
 
+
+class RBFHessianKernel(SteinKernel):
+    r""" Calculates the RBFHessianKernel from [1] (bottom of p. 4) given by
+    :math:`k(x,y)=\exp(\frac{1}{d}((x-y)^T M (x-y)))` 
+    where `d` is the dimension of the particles (`x` and `y` ) and
+    :math: `M = \frac{1}{m} \nabla_x^2 log p(x)|_{x=x_i}`
+
+    **References:**
+        Maken, F. A., Ramos, F., & Ott, L. (2022). Stein Particle Filter for Nonlinear, non-Gaussian State Estimation. 
+        IEEE Robotics and Automation Letters, 7(2), 5421-5428.
+
+    """
+    def __init__(self, mode='norm'):
+        assert mode == 'norm', f'RBFHessianKernel only defined for norm kernels'
+        self._mode = mode
+    
+    def compute(self, rng_key, particles, partilces_info, loss_fn):
+        M = -vmap(hessian(loss_fn))(particles, jnp.arange(particles.shape[0])).mean(0)
+
+        def kernel(x,y):
+            diff = jnp.reshape(x, -1) - jnp.reshape(y, -1)
+            return jnp.exp(-(1 / jnp.shape(diff)[0])  * diff.T @ M @ diff)
+        return kernel
+
+    @property
+    def mode(self):
+        return self._mode
 
 class IMQKernel(SteinKernel):
     """
@@ -144,7 +173,7 @@ class IMQKernel(SteinKernel):
     def _normed(self):
         return self._mode == "norm"
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(self, rng_key, particles, particle_info, loss_fn):
         def kernel(x, y):
             reduce = jnp.sum if self._normed() else lambda x: x
             return (self.const**2 + reduce((x - y) ** 2)) ** self.expon
@@ -171,7 +200,7 @@ class LinearKernel(SteinKernel):
     def mode(self):
         return self._mode
 
-    def compute(self, particles: jnp.ndarray, particle_info, loss_fn):
+    def compute(self, rng_key, particles: jnp.ndarray, particle_info, loss_fn):
         def kernel(x, y):
             if x.ndim == 1:
                 return x @ y + 1
@@ -229,7 +258,7 @@ class RandomFeatureKernel(SteinKernel):
                 rng_key, particles_shape[0], (self.bandwidth_subset,)
             )
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(self, rng_key, particles, particle_info, loss_fn):
         if self._random_weights is None:
             raise RuntimeError(
                 "The `.init` method should be called first to initialize the"
@@ -290,9 +319,10 @@ class MixtureKernel(SteinKernel):
     def mode(self):
         return self.kernel_fns[0].mode
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(self, rng_key, particles, particle_info, loss_fn):
+
         kernels = [
-            kf.compute(particles, particle_info, loss_fn) for kf in self.kernel_fns
+            kf.compute(rng_key, particles, particle_info, loss_fn) for kf in self.kernel_fns
         ]
 
         def kernel(x, y):
@@ -340,7 +370,7 @@ class GraphicalKernel(SteinKernel):
     def mode(self):
         return "matrix"
 
-    def compute(self, particles, particle_info, loss_fn):
+    def compute(self, rng_key, particles, particle_info, loss_fn):
         def pk_loss_fn(start, end):
             def fn(ps):
                 return loss_fn(
@@ -384,6 +414,7 @@ class ProbabilityProductKernel(SteinKernel):
 
     def compute(
         self,
+        rng_key,
         particles: jnp.ndarray,
         particle_info: dict[str, tuple[int, int]],
         loss_fn: Callable[[jnp.ndarray], float],
@@ -405,29 +436,51 @@ class ProbabilityProductKernel(SteinKernel):
 
         def kernel(x, y):
             biject = biject_to(self.guide.scale_constraint)
+            d = loc_idx.shape[0]
             x_loc = x[loc_idx]
             x_scale = biject(x[scale_idx])
-            x_quad = (x_loc / x_scale) ** 2
+            x_quad = ((x_loc / x_scale) ** 2).sum()
 
             y_loc = y[loc_idx]
             y_scale = biject(y[scale_idx])
-            y_quad = (y_loc / y_scale) ** 2
+            y_quad = ((y_loc / y_scale) ** 2).sum()
 
             cross_loc = x_loc * x_scale**-2 + y_loc * y_scale**-2
             cross_var = 1 / (y_scale**-2 + x_scale**-2)
-            cross_quad = cross_loc**2 * cross_var
+            cross_quad = (cross_loc**2 * cross_var).sum()
 
             quad = jnp.exp(-self.scale / 2 * (x_quad + y_quad - cross_quad))
 
-            norm = (
-                (2 * jnp.pi) ** ((1 - 2 * self.scale) * 1 / 2)
-                * self.scale ** (-1 / 2)
-                * cross_var ** (1 / 2)
-                * x_scale ** (-self.scale)
-                * y_scale ** (-self.scale)
-            )
+            return quad
 
-            return jnp.linalg.norm(norm * quad)
+        return kernel
+
+    @property
+    def mode(self):
+        return self._mode
+
+
+class CanonicalFunctionKernel(SteinKernel):
+    def __init__(self, inner_kernel, fn, can_proj):
+        self._mode = "norm"
+        self.inner_kernel = inner_kernel
+        self.fn = fn
+        self.can_proj = can_proj
+    
+
+    def compute(
+        self,
+        rng_key,
+        particles: jnp.ndarray,
+        particle_info: dict[str, tuple[int, int]],
+        loss_fn: Callable[[jnp.ndarray], float],
+    ):
+
+        #FIXME: THIS IS HACKY PARTICLE INFO SHOULD BE RECOMPUTED AND DOESN'T WORK WITH ALL KERNELS
+        inner_kfn = self.inner_kernel.compute(rng_key, vmap(lambda p: self.can_proj(rng_key, self.fn(p, particle_info)))(particles), particle_info, loss_fn)  
+
+        def kernel(x, y):
+            return inner_kfn(self.can_proj(rng_key, self.fn(x, particle_info)), self.can_proj(rng_key, self.fn(y, particle_info)))
 
         return kernel
 

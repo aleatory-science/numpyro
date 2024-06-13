@@ -25,7 +25,7 @@ import jax.numpy as jnp
 
 import numpyro
 from numpyro import deterministic
-from numpyro.contrib.einstein import IMQKernel, SteinVI
+from numpyro.contrib.einstein import IMQKernel, SteinVI, RBFHessianKernel
 from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredictive
 from numpyro.distributions import Gamma, Normal
 from numpyro.examples.datasets import BOSTON_HOUSING, load_dataset
@@ -135,8 +135,7 @@ def main(args):
         model,
         guide,
         Adagrad(0.05),
-        IMQKernel(),
-        # ProbabilityProductKernel(guide=guide, scale=1.),
+        RBFHessianKernel(),
         repulsion_temperature=args.repulsion,
         num_stein_particles=args.num_stein_particles,
         num_elbo_particles=args.num_elbo_particles,
@@ -148,7 +147,7 @@ def main(args):
         rng_key,
         args.max_iter,
         x,
-        y,
+        data.ytr,
         hidden_dim=args.hidden_dim,
         subsample_size=args.subsample_size,
         progress_bar=args.progress_bar,
@@ -165,11 +164,11 @@ def main(args):
     xte, _, _ = normalize(
         data.xte, xtr_mean, xtr_std
     )  # use train data statistics when accessing generalization
-    preds = pred(
+    y_pred = pred(
         pred_key, xte, subsample_size=xte.shape[0], hidden_dim=args.hidden_dim
     )["y_pred"]
 
-    y_pred = preds * ytr_std + ytr_mean
+    # y_pred = preds * ytr_std + ytr_mean
     rmse = jnp.sqrt(jnp.mean((y_pred.mean(0) - data.yte) ** 2))
 
     print(rf"Time taken: {datetime.timedelta(seconds=int(time_taken))}")
@@ -179,7 +178,7 @@ def main(args):
     mean_prediction = y_pred.mean(0)
 
     ran = np.arange(mean_prediction.shape[0])
-    percentiles = np.percentile(preds * ytr_std + ytr_mean, [5.0, 95.0], axis=0)
+    percentiles = np.percentile(y_pred, [5.0, 95.0], axis=0)
 
     # make plots
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)

@@ -52,7 +52,7 @@ class SteinLoss:
 
         log_guide_density = logsumexp(
             vmap(log_component_density)(jnp.arange(self.stein_num_particles))
-        )
+        ) - jnp.log(self.stein_num_particles)
 
         # 4. Score model
         seeded_model = seed(model, model_key)

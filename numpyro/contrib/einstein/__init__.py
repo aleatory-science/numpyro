@@ -5,9 +5,11 @@ from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredic
 from numpyro.contrib.einstein.stein_kernels import (
     GraphicalKernel,
     IMQKernel,
+    RBFHessianKernel,
     LinearKernel,
     MixtureKernel,
     ProbabilityProductKernel,
+    CanonicalFunctionKernel,
     RandomFeatureKernel,
     RBFKernel,
 )
@@ -18,6 +20,7 @@ __all__ = [
     "SteinVI",
     "SteinLoss",
     "RBFKernel",
+    "RBFHessianKernel",
     "IMQKernel",
     "LinearKernel",
     "RandomFeatureKernel",
@@ -25,4 +28,5 @@ __all__ = [
     "MixtureKernel",
     "ProbabilityProductKernel",
     "MixtureGuidePredictive",
+    "CanonicalFunctionKernel"
 ]

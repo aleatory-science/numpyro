@@ -300,9 +300,27 @@ class SteinVI:
             )
         )(non_mixture_uparams)
 
+        def loss_fn(particle, i):
+            particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
+            return (vmap(lambda elbo_key: 
+                self.stein_loss.single_particle_loss(
+                    rng_key=elbo_key,
+                    model=handlers.scale(
+                        self._inference_model, self.loss_temperature
+                    ),
+                    guide=self.guide,
+                    selected_particle=unravel_pytree(particle),
+                    unravel_pytree=unravel_pytree,
+                    flat_particles=ctstein_particles,
+                    select_index=i,
+                    model_args=args,
+                    model_kwargs=kwargs,
+                    param_map=self.constrain_fn(non_mixture_uparams),
+                ))(random.split( particle_keys[i], self.stein_loss.elbo_num_particles))).mean()
+
         # 3. Calculate kernel of particles
         kernel = self.kernel_fn.compute(
-            stein_particles, particle_info, kernel_particles_loss_fn
+            rng_key, ctstein_particles, particle_info, loss_fn
         )
 
         # 4. Calculate the attractive force and repulsive force on the particles
