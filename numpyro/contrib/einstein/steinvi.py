@@ -21,7 +21,7 @@ from numpyro.contrib.einstein.stein_util import (
 )
 from numpyro.contrib.funsor import config_enumerate, enum
 from numpyro.distributions import Distribution
-from numpyro.distributions.transforms import IdentityTransform
+from numpyro.distributions.transforms import IdentityTransform, ComposeTransform
 from numpyro.infer.autoguide import AutoGuide
 from numpyro.infer.util import _guess_max_plate_nesting, transform_fn
 from numpyro.optim import _NumPyroOptim
@@ -239,7 +239,7 @@ class SteinVI:
         # 2. Calculate gradients for each particle
         def kernel_particles_loss_fn(
             rng_key, particles
-        ):  # TODO: rewrite using def to utilize jax caching
+        ):
             particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
             grads = vmap(
                 lambda i: grad(
@@ -251,9 +251,9 @@ class SteinVI:
                                     self._inference_model, self.loss_temperature
                                 ),
                                 guide=self.guide,
-                                selected_particle=unravel_pytree(particle),
+                                selected_particle=self.constrain_fn(unravel_pytree(particle)),
                                 unravel_pytree=unravel_pytree,
-                                flat_particles=particles,
+                                flat_particles=vmap(particle_transform_fn)(particles),
                                 select_index=i,
                                 model_args=args,
                                 model_kwargs=kwargs,
@@ -272,20 +272,17 @@ class SteinVI:
 
         def particle_transform_fn(particle):
             params = unravel_pytree(particle)
-
-            tparams = self.particle_transform_fn(params)
-            ctparams = self.constrain_fn(tparams)
-            tparticle, _ = ravel_pytree(tparams)
+            ctparams = self.constrain_fn(self.particle_transform_fn(params))
             ctparticle, _ = ravel_pytree(ctparams)
-            return tparticle, ctparticle
+            return ctparticle
 
         # 2.1 Lift particles to constraint space
-        tstein_particles, ctstein_particles = vmap(particle_transform_fn)(
+        ctstein_particles = vmap(particle_transform_fn)(
             stein_particles
         )
 
         # 2.2 Compute particle gradients (for attractive force)
-        particle_ljp_grads = kernel_particles_loss_fn(attractive_key, ctstein_particles)
+        particle_ljp_grads = kernel_particles_loss_fn(attractive_key, stein_particles)
 
         # 2.2 Compute non-mixture parameter gradients
         non_mixture_param_grads = grad(
@@ -309,7 +306,7 @@ class SteinVI:
                         self._inference_model, self.loss_temperature
                     ),
                     guide=self.guide,
-                    selected_particle=unravel_pytree(particle),
+                    selected_particle=self.constrain_fn(unravel_pytree(particle)),
                     unravel_pytree=unravel_pytree,
                     flat_particles=ctstein_particles,
                     select_index=i,
@@ -320,7 +317,7 @@ class SteinVI:
 
         # 3. Calculate kernel of particles
         kernel = self.kernel_fn.compute(
-            rng_key, ctstein_particles, particle_info, loss_fn
+            rng_key, stein_particles, particle_info, loss_fn
         )
 
         # 4. Calculate the attractive force and repulsive force on the particles
@@ -328,53 +325,22 @@ class SteinVI:
             lambda y: jnp.sum(
                 vmap(
                     lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad)
-                )(tstein_particles, particle_ljp_grads),
+                )(stein_particles, particle_ljp_grads),
                 axis=0,
             )
-        )(tstein_particles)
+        )(stein_particles)
+
         repulsive_force = vmap(
-            lambda y: jnp.sum(
+            lambda y: jnp.mean(
                 vmap(
                     lambda x: self.repulsion_temperature
                     * self._kernel_grad(kernel, x, y)
-                )(tstein_particles),
+                )(stein_particles),
                 axis=0,
             )
-        )(tstein_particles)
+        )(stein_particles)
 
-        def single_particle_grad(particle, attr_forces, rep_forces):
-            def _nontrivial_jac(var_name, var):
-                if isinstance(self.particle_transforms[var_name], IdentityTransform):
-                    return None
-                return jacfwd(self.particle_transforms[var_name].inv)(var)
-
-            def _update_force(attr_force, rep_force, jac):
-                force = attr_force.reshape(-1) + rep_force.reshape(-1)
-                if jac is not None:
-                    force = force @ jac.reshape(
-                        (_numel(jac.shape[: len(jac.shape) // 2]), -1)
-                    )
-                return force.reshape(attr_force.shape)
-
-            reparam_jac = {
-                name: tree_map(lambda var: _nontrivial_jac(name, var), variables)
-                for name, variables in unravel_pytree(particle).items()
-            }
-            jac_params = tree_map(
-                _update_force,
-                unravel_pytree(attr_forces),
-                unravel_pytree(rep_forces),
-                reparam_jac,
-            )
-            jac_particle, _ = ravel_pytree(jac_params)
-            return jac_particle
-
-        particle_grads = (
-            vmap(single_particle_grad)(
-                stein_particles, attractive_force, repulsive_force
-            )
-            / self.num_stein_particles
-        )
+        particle_grads =  attractive_force + repulsive_force
 
         # 5. Decompose the monolithic particle forces back to concrete parameter values
         stein_param_grads = unravel_pytree_batched(particle_grads)
@@ -438,9 +404,7 @@ class SteinVI:
                 transform = get_parameter_transform(site)
                 inv_transforms[site["name"]] = transform
                 transforms[site["name"]] = transform.inv
-                particle_transforms[site["name"]] = site.get(
-                    "particle_transform", IdentityTransform()
-                )
+                particle_transforms[site["name"]] = transform #ComposeTransform( site.get( "particle_transform", IdentityTransform()), transform)
                 if site["name"] in guide_init_params:
                     pval = guide_init_params[site["name"]]
                     if self.non_mixture_params_fn(site["name"]):

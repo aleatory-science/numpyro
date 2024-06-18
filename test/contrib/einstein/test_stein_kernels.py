@@ -10,6 +10,11 @@ import pytest
 
 from jax import numpy as jnp, random
 
+from numpyro import sample
+from numpyro.distributions import Normal
+from numpyro.infer.autoguide import AutoNormal
+from numpyro.infer.initialization import init_to_value
+
 from numpyro.contrib.einstein import SteinVI
 from numpyro.contrib.einstein.stein_kernels import (
     GraphicalKernel,
@@ -18,6 +23,7 @@ from numpyro.contrib.einstein.stein_kernels import (
     MixtureKernel,
     RandomFeatureKernel,
     RBFKernel,
+    ProbabilityProductKernel
 )
 from numpyro.optim import Adam
 
@@ -26,6 +32,9 @@ T = namedtuple("TestSteinKernel", ["kernel", "particle_info", "loss_fn", "kval"]
 PARTICLES_2D = np.array([[1.0, 2.0], [-10.0, 10.0], [7.0, 3.0], [2.0, -1]])
 
 TPARTICLES_2D = (np.array([1.0, 2.0]), np.array([10.0, 5.0]))  # transformed particles
+
+def MOCK_MODEL(): sample('x', Normal())
+
 TEST_CASES = [
     T(
         RBFKernel,
@@ -63,6 +72,17 @@ TEST_CASES = [
         lambda x: x,
         {"matrix": np.array([[0.040711474, 0.0], [0.0, 0.040711474]])},
     ),
+    T(
+        lambda mode: ProbabilityProductKernel(
+            mode=mode, 
+            guide=AutoNormal(MOCK_MODEL)
+        ),
+        lambda d: {'x_auto_loc': (0,1), 'x_auto_scale': (1,2)},
+        lambda x: x,
+        # eq. 5 Probability Product Kernels
+        # exp(-.5 ((1/2)**2 + (10/5) ** 2 - (1/4 + 2/5) ** 2 / (1/4 + 1/25))) 
+        {"norm": 0.24744876608},  
+    ),
 ]
 
 PARTICLES = [(PARTICLES_2D, TPARTICLES_2D)]
@@ -79,11 +99,11 @@ def test_kernel_forward(
     kernel, particles, particle_info, loss_fn, tparticles, mode, kval
 ):
     if mode not in kval:
-        return
+        pytest.skip()
     (d,) = tparticles[0].shape
     kernel = kernel(mode=mode)
     kernel.init(random.PRNGKey(0), particles.shape)
-    kernel_fn = kernel.compute(particles, particle_info(d), loss_fn)
+    kernel_fn = kernel.compute(random.PRNGKey(0), particles, particle_info(d), loss_fn)
     value = kernel_fn(*tparticles)
     assert_allclose(value, jnp.array(kval[mode]), atol=1e-6)
 
@@ -101,7 +121,7 @@ def test_apply_kernel(
     (d,) = tparticles[0].shape
     kernel_fn = kernel(mode=mode)
     kernel_fn.init(random.PRNGKey(0), particles.shape)
-    kernel_fn = kernel_fn.compute(particles, particle_info(d), loss_fn)
+    kernel_fn = kernel_fn.compute(random.PRNGKey(0), particles, particle_info(d), loss_fn)
     v = np.ones_like(kval[mode])
     stein = SteinVI(id, id, Adam(1.0), kernel(mode))
     value = stein._apply_kernel(kernel_fn, *tparticles, v)

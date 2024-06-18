@@ -48,10 +48,10 @@ class SteinLoss:
             )
             # Validate
             check_model_guide_match(component_trace, chosen_trace)
-            return log_cdensity
+            return jnp.where(i != select_index, log_cdensity, 0.)
 
         log_guide_density = logsumexp(
-            vmap(log_component_density)(jnp.arange(self.stein_num_particles))
+            vmap(log_component_density)(jnp.arange(self.stein_num_particles)) + log_chosen_density
         ) - jnp.log(self.stein_num_particles)
 
         # 4. Score model

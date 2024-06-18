@@ -382,9 +382,11 @@ class GraphicalKernel(SteinKernel):
             return fn
 
         local_kernels = []
-        for pk, (start_idx, end_idx) in particle_info.items():
+        keys = random.split(rng_key, len(particle_info))
+        for key, (pk, (start_idx, end_idx)) in zip(keys, particle_info.items()):
             pk_kernel_fn = self.local_kernel_fns.get(pk, self.default_kernel_fn)
             pk_kernel = pk_kernel_fn.compute(
+                key,
                 particles[:, start_idx:end_idx],
                 {pk: (0, end_idx - start_idx)},
                 pk_loss_fn(start_idx, end_idx),
@@ -406,7 +408,8 @@ class GraphicalKernel(SteinKernel):
 
 
 class ProbabilityProductKernel(SteinKernel):
-    def __init__(self, guide, scale=1.0):
+    def __init__(self, guide, scale=1.0, mode="norm"):
+        assert mode == "norm"
         self._mode = "norm"
         self.guide = guide
         self.scale = scale
