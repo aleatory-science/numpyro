@@ -41,17 +41,17 @@ class SteinLoss:
         # 3. Score mixture guide
         def log_component_density(i):
             log_cdensity, component_trace = log_density(
-                replay(seed(guide, guide_key[i]), chosen_trace),
+                replay(seed(guide, guide_key[i]), chosen_trace),  # TODO: how does grad of replay behave?
                 model_args,
                 model_kwargs,
                 {**param_map, **unravel_pytree(flat_particles[i])},
             )
             # Validate
             check_model_guide_match(component_trace, chosen_trace)
-            return jnp.where(i != select_index, log_cdensity, 0.)
+            return jnp.where(i != jnp.array(select_index).astype(int), log_cdensity, log_chosen_density)
 
         log_guide_density = logsumexp(
-            vmap(log_component_density)(jnp.arange(self.stein_num_particles)) + log_chosen_density
+            vmap(log_component_density)(jnp.arange(self.stein_num_particles))
         ) - jnp.log(self.stein_num_particles)
 
         # 4. Score model
