@@ -228,7 +228,7 @@ class SteinVI:
 
         # 1. Collect each guide parameter into monolithic particles that capture correlations
         # between parameter values across each individual particle
-        stein_particles, unravel_pytree, unravel_pytree_batched = batch_ravel_pytree(
+        stein_particles, unravel_pytree, unravel_pytree_batched = batch_ravel_pytree(  # TODO: debug this!
             stein_uparams, nbatch_dims=1
         )
         particle_info, _ = self._calc_particle_info(
@@ -236,84 +236,64 @@ class SteinVI:
         )
         attractive_key, classic_key = random.split(rng_key)
 
-        # 2. Calculate gradients for each particle
-        def kernel_particles_loss_fn(
-            rng_key, particles
-        ):
-            particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
-            grads = vmap(
-                lambda i: grad(
-                    lambda particle: (
-                        vmap(
-                            lambda elbo_key: self.stein_loss.single_particle_loss(
-                                rng_key=elbo_key,
-                                model=handlers.scale(
-                                    self._inference_model, self.loss_temperature
-                                ),
-                                guide=self.guide,
-                                selected_particle=self.constrain_fn(unravel_pytree(particle)),
-                                unravel_pytree=unravel_pytree,
-                                flat_particles=vmap(particle_transform_fn)(particles),
-                                select_index=i,
-                                model_args=args,
-                                model_kwargs=kwargs,
-                                param_map=self.constrain_fn(non_mixture_uparams),
-                            )
-                        )(
-                            random.split(
-                                particle_keys[i], self.stein_loss.elbo_num_particles
-                            )
-                        )
-                    ).mean()
-                )(particles[i])
-            )(jnp.arange(self.stein_loss.stein_num_particles))
-
-            return grads
-
         def particle_transform_fn(particle):
             params = unravel_pytree(particle)
             ctparams = self.constrain_fn(self.particle_transform_fn(params))
             ctparticle, _ = ravel_pytree(ctparams)
             return ctparticle
 
-        # 2.1 Lift particles to constraint space
-        ctstein_particles = vmap(particle_transform_fn)(
-            stein_particles
-        )
-
-        # 2.2 Compute particle gradients (for attractive force)
-        particle_ljp_grads = kernel_particles_loss_fn(attractive_key, stein_particles)
+        # 2. Calculate gradients for each particle
+        def particle_grads(
+            rng_key, particles
+        ):
+            grads = grad(
+                lambda ps:
+                self.stein_loss.particle_loss(
+                rng_key,
+                vmap(particle_transform_fn)(ps),
+                self.model,
+                self.guide,
+                unravel_pytree,
+                args,
+                kwargs,
+                self.constrain_fn(non_mixture_uparams),
+            ))(particles)
+                
+            return grads
 
         # 2.2 Compute non-mixture parameter gradients
-        non_mixture_param_grads = grad(
-            lambda cps: -self.stein_loss.loss(
-                classic_key,
-                self.constrain_fn(cps),
-                handlers.scale(self._inference_model, self.loss_temperature),
+        non_mixture_param_grads = grad(lambda param_map: 
+            self.stein_loss.particle_loss(
+                rng_key,
+                vmap(particle_transform_fn)(stein_particles),
+                self.model,
                 self.guide,
-                unravel_pytree_batched(ctstein_particles),
-                *args,
-                **kwargs,
-            )
-        )(non_mixture_uparams)
+                unravel_pytree,
+                args,
+                kwargs,
+                self.constrain_fn(param_map),
+            ))(non_mixture_uparams)
+
 
         def loss_fn(particle, i):
-            particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
-            return (vmap(lambda elbo_key: 
-                self.stein_loss.single_particle_loss(
-                    rng_key=elbo_key,
-                    model=handlers.scale(
-                        self._inference_model, self.loss_temperature
-                    ),
-                    guide=self.guide,
-                    selected_particle=self.constrain_fn(unravel_pytree(particle)),
-                    unravel_pytree=unravel_pytree,
-                    flat_particles=ctstein_particles,
-                    select_index=i,
-                    model_args=args,
-                    model_kwargs=kwargs,
-                    param_map=self.constrain_fn(non_mixture_uparams),
-                ))(random.split( particle_keys[i], self.stein_loss.elbo_num_particles))).mean()
+            # FIXME
+            return 0.
+            # particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
+            # return (vmap(lambda elbo_key: 
+            #     self.stein_loss.single_particle_loss(
+            #         rng_key=elbo_key,
+            #         model=handlers.scale(
+            #             self._inference_model, self.loss_temperature
+            #         ),
+            #         guide=self.guide,
+            #         selected_particle=self.constrain_fn(unravel_pytree(particle)),
+            #         unravel_pytree=unravel_pytree,
+            #         flat_particles=ctstein_particles,
+            #         select_index=i,
+            #         model_args=args,
+            #         model_kwargs=kwargs,
+            #         param_map=self.constrain_fn(non_mixture_uparams),
+            #     ))(random.split( particle_keys[i], self.stein_loss.elbo_num_particles))).mean()
 
         # 3. Calculate kernel of particles
         kernel = self.kernel_fn.compute(
@@ -322,15 +302,15 @@ class SteinVI:
 
         # 4. Calculate the attractive force and repulsive force on the particles
         attractive_force = vmap(
-            lambda y: jnp.sum(
+            lambda y, key: jnp.sum(
                 vmap(
-                    lambda x, x_ljp_grad: self._apply_kernel(kernel, x, y, x_ljp_grad)
-                )(stein_particles, particle_ljp_grads),
+                    lambda x, x_score: self._apply_kernel(kernel, x, y, x_score)
+                )(stein_particles, particle_grads(key, stein_particles)),
                 axis=0,
             )
-        )(stein_particles)
+        )(stein_particles, random.split(attractive_key, self.num_stein_particles))
 
-        repulsive_force = vmap(
+        repulsive_force = vmap( # TODO: reconsider this!
             lambda y: jnp.mean(
                 vmap(
                     lambda x: self.repulsion_temperature

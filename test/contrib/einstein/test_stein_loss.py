@@ -63,43 +63,38 @@ def test_stein_particle_loss():
         x = numpyro.param('x', 0.)
         numpyro.sample("z", dist.Normal(x, 1))
 
-    def stein_loss_fn(chosen_particle, obs, particles, assign):
+    def stein_loss_fn(particles, obs):
         return SteinLoss(
             elbo_num_particles=1, stein_num_particles=3
-        ).single_particle_loss(
+        )._single_draw_particle_loss(
             random.PRNGKey(0),
+            particles,
             model,
             guide,
-            chosen_particle,
             unravel_pytree,
-            particles,
-            assign,
             (obs,),
             {},
             {},
         )
 
     xs = jnp.array([-1, 0.5, 3.0])
-    num_particles = xs.shape[0]
-    particles = {"x": xs}
-    zs = jnp.array([0.16055810451507568,1.4552721977233887, 1.23018217086792])   # from inspect
+    m = xs.shape[0]
+    ps = {"x": xs}
+    zs = jnp.array([-0.90424156, 1.4490576, 2.5476568]) - xs # from inspect
+    obs = 2.
 
-    flat_particles, unravel_pytree, _ = batch_ravel_pytree(particles, nbatch_dims=1)
+    flat_ps, unravel_pytree, _ = batch_ravel_pytree(ps, nbatch_dims=1)
+    act_loss, act_grad = value_and_grad(stein_loss_fn)(flat_ps, obs)
 
-    for i in range(num_particles):
-        chosen_particle = {"x": jnp.array([-1.])}
-        act_loss, act_grad = value_and_grad(stein_loss_fn)(
-            chosen_particle, 2.0, flat_particles, i
-        )
+    def exp_loss(xs):
+        loss = 0.
+        for i in range(m):
+            z = zs[i] + xs[i]  # Normal.sample uses loc + eps*scale
+            lp_m = dist.Normal().log_prob(z) + dist.Normal(z).log_prob(obs)
+            lp_g = logsumexp(dist.Normal(xs).log_prob(z)) - jnp.log(m)
+            loss += (lp_m - lp_g) / m
+        return loss
 
-        z = zs[i]
-        lp_m = dist.Normal().log_prob(z) + dist.Normal(z).log_prob(2.)
-        lp_g = logsumexp(dist.Normal(xs).log_prob(z)) - jnp.log(3)
-        exp_loss = lp_m - lp_g
-        # assert_allclose(act_loss, exp_loss)
+    assert_allclose(act_loss, exp_loss(xs))
 
-        # TODO: hand compute the particle losses
-        dm =  grad(lambda x: dist.Normal(x).log_prob(z))(xs[i]) * exp_loss
-        dg =  grad(lambda x: jnp.exp(dist.Normal(x).log_prob(z)))(xs[i]) / jnp.exp(dist.Normal(xs).log_prob(z)).sum()
-        exp_grad = dm - dg
-        assert_allclose(act_grad, exp_grad)
+    assert_allclose(act_grad.squeeze(), grad(exp_loss)(xs))
