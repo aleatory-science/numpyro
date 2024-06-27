@@ -320,16 +320,12 @@ class SteinVI:
             )
         )(stein_particles)
 
-        particle_grads =  attractive_force + repulsive_force
+        stein_force =  attractive_force - repulsive_force
 
         # 5. Decompose the monolithic particle forces back to concrete parameter values
-        stein_param_grads = unravel_pytree_batched(particle_grads)
+        grads = unravel_pytree_batched(stein_force)
 
-        # 6. Return loss and gradients (based on parameter forces)
-        res_grads = tree_map(
-            lambda x: -x, {**non_mixture_param_grads, **stein_param_grads}
-        )
-        return jnp.linalg.norm(particle_grads), res_grads
+        return jnp.linalg.norm(stein_force), grads
 
     def init(self, rng_key, *args, **kwargs):
         """Register random variable transformations, constraints and determine initialize positions of the particles.
@@ -373,7 +369,7 @@ class SteinVI:
                 and site["fn"].is_discrete
             ):
                 if site["fn"].has_enumerate_support and self.enum:
-                    should_enum = True
+                    should_enum = True_apply_kernel
                 else:
                     raise Exception(
                         "Cannot enumerate model with discrete variables without enumerate support"

@@ -107,7 +107,7 @@ class SteinLoss:
             param_map,
         )
 
-        return vmap(loss_fn)(random.split(rng_key, self.elbo_num_particles)).mean()
+        return -vmap(loss_fn)(random.split(rng_key, self.elbo_num_particles)).mean()
 
     def loss(self, rng_key, param_map, model, guide, particles, *args, **kwargs):
         if not particles:
@@ -116,4 +116,4 @@ class SteinLoss:
         flat_particles, unravel_pytree, _ = batch_ravel_pytree(particles, nbatch_dims=1)
 
         # NOTE: No longer sampling an assignment!
-        return -self.particle_loss(rng_key, flat_particles, model, guide, unravel_pytree, args, kwargs, param_map)
+        return self.particle_loss(rng_key, flat_particles, model, guide, unravel_pytree, args, kwargs, param_map)

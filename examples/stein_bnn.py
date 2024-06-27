@@ -25,13 +25,13 @@ import jax.numpy as jnp
 
 import numpyro
 from numpyro import deterministic
-from numpyro.contrib.einstein import IMQKernel, SteinVI, RBFHessianKernel
+from numpyro.contrib.einstein import IMQKernel, SteinVI, RBFHessianKernel, ProbabilityProductKernel, RBFKernel
 from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredictive
 from numpyro.distributions import Gamma, Normal
 from numpyro.examples.datasets import BOSTON_HOUSING, load_dataset
 from numpyro.infer import init_to_uniform
-from numpyro.infer.autoguide import AutoNormal
-from numpyro.optim import Adagrad
+from numpyro.infer.autoguide import AutoNormal, AutoDelta
+from numpyro.optim import Adagrad, Adam
 
 DataState = namedtuple("data", ["xtr", "xte", "ytr", "yte"])
 
@@ -129,13 +129,14 @@ def main(args):
 
     rng_key, inf_key = random.split(inf_key)
 
-    guide = AutoNormal(model, init_loc_fn=partial(init_to_uniform, radius=0.1))
+    guide = AutoNormal(model)
 
     stein = SteinVI(
         model,
         guide,
-        Adagrad(0.05),
-        RBFHessianKernel(),
+        Adam(0.01),
+        ProbabilityProductKernel(guide),
+        # RBFKernel(),
         repulsion_temperature=args.repulsion,
         num_stein_particles=args.num_stein_particles,
         num_elbo_particles=args.num_elbo_particles,
@@ -165,11 +166,11 @@ def main(args):
         data.xte, xtr_mean, xtr_std
     )  # use train data statistics when accessing generalization
     y_pred = pred(
-        pred_key, xte, subsample_size=xte.shape[0], hidden_dim=args.hidden_dim
+        pred_key, x, subsample_size=x.shape[0], hidden_dim=args.hidden_dim
     )["y_pred"]
 
     # y_pred = preds * ytr_std + ytr_mean
-    rmse = jnp.sqrt(jnp.mean((y_pred.mean(0) - data.yte) ** 2))
+    rmse = jnp.sqrt(jnp.mean((y_pred.mean(0) - data.ytr) ** 2))
 
     print(rf"Time taken: {datetime.timedelta(seconds=int(time_taken))}")
     print(rf"RMSE: {rmse:.2f}")
@@ -187,12 +188,11 @@ def main(args):
             zip(zip(ran, percentiles[0]), zip(ran, percentiles[1])), colors="lightblue"
         )
     )
-    ax.plot(data.yte, "kx", label="y true")
+    ax.plot(data.ytr, "kx", label="y true")
     ax.plot(mean_prediction, "ko", label="y pred")
     ax.set(xlabel="example", ylabel="y", title="Mean predictions with 90% CI")
     ax.legend()
     fig.savefig("stein_bnn.pdf")
-
 
 if __name__ == "__main__":
     jax.config.update("jax_debug_nans", True)
