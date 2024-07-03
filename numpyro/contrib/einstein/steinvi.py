@@ -243,10 +243,9 @@ class SteinVI:
             particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
             grads = vmap(
                 lambda i: grad(
-                    lambda particle: (
-                        vmap(
-                            lambda elbo_key: self.stein_loss.single_particle_loss(
-                                rng_key=elbo_key,
+                    lambda particle:
+                        self.stein_loss.particle_loss(
+                                rng_key=rng_key,
                                 model=handlers.scale(
                                     self._inference_model, self.loss_temperature
                                 ),
@@ -259,12 +258,6 @@ class SteinVI:
                                 model_kwargs=kwargs,
                                 param_map=self.constrain_fn(non_mixture_uparams),
                             )
-                        )(
-                            random.split(
-                                particle_keys[i], self.stein_loss.elbo_num_particles
-                            )
-                        )
-                    ).mean()
                 )(particles[i])
             )(jnp.arange(self.stein_loss.stein_num_particles))
 
@@ -298,10 +291,8 @@ class SteinVI:
         )(non_mixture_uparams)
 
         def loss_fn(particle, i):
-            particle_keys = random.split(rng_key, self.stein_loss.stein_num_particles)
-            return (vmap(lambda elbo_key: 
-                self.stein_loss.single_particle_loss(
-                    rng_key=elbo_key,
+            return self.stein_loss.particle_loss(
+                    rng_key=rng_key,
                     model=handlers.scale(
                         self._inference_model, self.loss_temperature
                     ),
@@ -313,7 +304,7 @@ class SteinVI:
                     model_args=args,
                     model_kwargs=kwargs,
                     param_map=self.constrain_fn(non_mixture_uparams),
-                ))(random.split( particle_keys[i], self.stein_loss.elbo_num_particles))).mean()
+                )
 
         # 3. Calculate kernel of particles
         kernel = self.kernel_fn.compute(
