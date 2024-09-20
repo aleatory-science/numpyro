@@ -454,6 +454,41 @@ class SteinVI:
         optim_state = self.optim.update(grads, optim_state)
         return SteinVIState(optim_state, rng_key), loss_val
 
+    def setup_run(
+            self,
+            rng_key,
+            num_steps,
+            args,
+            init_state,
+            kwargs):
+
+        if init_state is None:
+            state = self.init(rng_key, *args, **kwargs)
+        else:
+            state = init_state
+        loss = self.evaluate(state, *args, **kwargs)
+
+        info_init = (state, loss)
+
+        def step(info):
+            state, loss = info
+            return self.update(state, *args, **kwargs)  # uses closure!
+        
+        def collect(info):
+            _, loss = info
+            return loss
+        
+        def extract(info):
+            state, _ = info
+            return state
+        
+        def diagnostic(info):
+            _, loss = info
+            return f"Stein force {loss:.2f}."
+
+        return step, diagnostic, collect, extract, info_init
+
+
     def run(
         self,
         rng_key,
@@ -461,32 +496,63 @@ class SteinVI:
         *args,
         progress_bar=True,
         init_state=None,
-        collect_fn=lambda val: val[1],  # TODO: refactor
         **kwargs,
     ):
-        def bodyfn(_i, info):
-            body_state = info[0]
-            return (*self.update(body_state, *info[2:], **kwargs), *info[2:])
 
-        if init_state is None:
-            state = self.init(rng_key, *args, **kwargs)
-        else:
-            state = init_state
-        loss = self.evaluate(state, *args, **kwargs)
+        step, diagnostic, collect, extract, init_info = self.setup_run(
+            rng_key,
+            num_steps,
+            args,
+            init_state,
+            kwargs)
+
         auxiliaries, last_res = fori_collect(
             0,
             num_steps,
-            lambda info: bodyfn(0, info),
-            (state, loss, *args),
+            step,
+            init_info,
             progbar=progress_bar,
-            transform=collect_fn,
+            transform=collect,
             return_last_val=True,
-            diagnostics_fn=lambda state: f"norm Stein force: {state[1]:.3f}"
-            if progress_bar
-            else None,
+            diagnostics_fn=diagnostic if progress_bar else None,
         )
-        state = last_res[0]
+
+        state = extract(last_res)
         return SteinVIRunResult(self.get_params(state), state, auxiliaries)
+
+    # def run(
+    #     self,
+    #     rng_key,
+    #     num_steps,
+    #     *args,
+    #     progress_bar=True,
+    #     init_state=None,
+    #     collect_fn=lambda val: val[1],  # TODO: refactor
+    #     **kwargs,
+    # ):
+    #     def bodyfn(_i, info):
+    #         body_state = info[0]
+    #         return (*self.update(body_state, *info[2:], **kwargs), *info[2:])
+
+    #     if init_state is None:
+    #         state = self.init(rng_key, *args, **kwargs)
+    #     else:
+    #         state = init_state
+    #     loss = self.evaluate(state, *args, **kwargs)
+    #     auxiliaries, last_res = fori_collect(
+    #         0,
+    #         num_steps,
+    #         lambda info: bodyfn(0, info),
+    #         (state, loss, *args),
+    #         progbar=progress_bar,
+    #         transform=collect_fn,
+    #         return_last_val=True,
+    #         diagnostics_fn=lambda state: f"norm Stein force: {state[1]:.3f}"
+    #         if progress_bar
+    #         else None,
+    #     )
+    #     state = last_res[0]
+    #     return SteinVIRunResult(self.get_params(state), state, auxiliaries)
 
     def evaluate(self, state, *args, **kwargs):
         """
