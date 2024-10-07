@@ -9,29 +9,28 @@ from the UCI regression benchmarks.
 """
 
 import argparse
+
 from collections import namedtuple
-import datetime
 from functools import partial
+
+import datetime
 from time import time
 
 from matplotlib.collections import LineCollection
 import matplotlib.pyplot as plt
-import numpy as np
+
+from jax import random, numpy as jnp, nn, config
+
 from sklearn.model_selection import train_test_split
-
-import jax
-from jax import random
-import jax.numpy as jnp
-
-import numpyro
-from numpyro import deterministic
-from numpyro.contrib.einstein import RBFKernel, SteinVI
-from numpyro.contrib.einstein.mixture_guide_predictive import MixtureGuidePredictive
-from numpyro.distributions import Gamma, Normal
 from numpyro.examples.datasets import BOSTON_HOUSING, load_dataset
+
+from numpyro import deterministic, sample, plate, set_platform, subsample
+from numpyro.distributions import Gamma, Normal
+
+from numpyro.contrib.einstein import RBFKernel, MixtureGuidePredictive, SteinVI
+from numpyro.optim import Adagrad
 from numpyro.infer import init_to_uniform
 from numpyro.infer.autoguide import AutoNormal
-from numpyro.optim import Adagrad
 
 DataState = namedtuple("data", ["xtr", "xte", "ytr", "yte"])
 
@@ -59,18 +58,18 @@ def model(x, y=None, hidden_dim=50, subsample_size=100):
 
     **References:**
         1. *Stein variational gradient descent: A general purpose bayesian inference algorithm*
-        Qiang Liu and Dilin Wang (2016).
+            Qiang Liu and Dilin Wang (2016).
     """
 
-    prec_nn = numpyro.sample(
+    prec_nn = sample(
         "prec_nn", Gamma(1.0, 0.1)
     )  # hyper prior for precision of nn weights and biases
 
     n, m = x.shape
 
-    with numpyro.plate("l1_hidden", hidden_dim, dim=-1):
+    with plate("l1_hidden", hidden_dim, dim=-1):
         # prior l1 bias term
-        b1 = numpyro.sample(
+        b1 = sample(
             "nn_b1",
             Normal(
                 0.0,
@@ -79,38 +78,38 @@ def model(x, y=None, hidden_dim=50, subsample_size=100):
         )
         assert b1.shape == (hidden_dim,)
 
-        with numpyro.plate("l1_feat", m, dim=-2):
-            w1 = numpyro.sample(
+        with plate("l1_feat", m, dim=-2):
+            w1 = sample(
                 "nn_w1", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
             )  # prior on l1 weights
             assert w1.shape == (m, hidden_dim)
 
-    with numpyro.plate("l2_hidden", hidden_dim, dim=-1):
-        w2 = numpyro.sample(
+    with plate("l2_hidden", hidden_dim, dim=-1):
+        w2 = sample(
             "nn_w2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
         )  # prior on output weights
 
-    b2 = numpyro.sample(
+    b2 = sample(
         "nn_b2", Normal(0.0, 1.0 / jnp.sqrt(prec_nn))
     )  # prior on output bias term
 
     # precision prior on observations
-    prec_obs = numpyro.sample("prec_obs", Gamma(1.0, 0.1))
-    with numpyro.plate(
+    prec_obs = sample("prec_obs", Gamma(1.0, 0.1))
+    with plate(
         "data",
         x.shape[0],
         subsample_size=subsample_size,
         dim=-1,
     ):
-        batch_x = numpyro.subsample(x, event_dim=1)
+        batch_x = subsample(x, event_dim=1)
         if y is not None:
-            batch_y = numpyro.subsample(y, event_dim=0)
+            batch_y = subsample(y, event_dim=0)
         else:
             batch_y = y
 
-        loc_y = deterministic("y_pred", jnp.maximum(batch_x @ w1 + b1, 0) @ w2 + b2)
+        loc_y = deterministic("y_pred", nn.relu(batch_x @ w1 + b1) @ w2 + b2)
 
-        numpyro.sample(
+        sample(
             "y",
             Normal(
                 loc_y, 1.0 / jnp.sqrt(prec_obs)
@@ -125,16 +124,14 @@ def main(args):
     inf_key, pred_key, data_key = random.split(random.PRNGKey(args.rng_key), 3)
     # normalize data and labels to zero mean unit variance!
     x, xtr_mean, xtr_std = normalize(data.xtr)
-    y, ytr_mean, ytr_std = normalize(data.ytr)
 
     rng_key, inf_key = random.split(inf_key)
 
     guide = AutoNormal(model, init_loc_fn=partial(init_to_uniform, radius=0.1))
-
     stein = SteinVI(
         model,
         guide,
-        Adagrad(0.05),
+        Adagrad(0.5),
         RBFKernel(),
         repulsion_temperature=args.repulsion,
         num_stein_particles=args.num_stein_particles,
@@ -158,7 +155,7 @@ def main(args):
         model,
         guide=stein.guide,
         params=stein.get_params(result.state),
-        num_samples=100,
+        num_samples=1000,
         guide_sites=stein.guide_sites,
     )
     xte, _, _ = normalize(
@@ -168,17 +165,16 @@ def main(args):
         pred_key, xte, subsample_size=xte.shape[0], hidden_dim=args.hidden_dim
     )["y_pred"]
 
-    # y_pred = preds * ytr_std + ytr_mean
     rmse = jnp.sqrt(jnp.mean((y_pred.mean(0) - data.yte) ** 2))
 
     print(rf"Time taken: {datetime.timedelta(seconds=int(time_taken))}")
     print(rf"RMSE: {rmse:.2f}")
 
-    # compute mean prediction and confidence interval around median
-    mean_prediction = y_pred.mean(0)
+    # compute mean prediction and confidence interval around 
+    median_prediction = jnp.median(y_pred, 0)
 
-    ran = np.arange(mean_prediction.shape[0])
-    percentiles = np.percentile(y_pred, [5.0, 95.0], axis=0)
+    ran = jnp.arange(median_prediction.shape[0])
+    percentiles = jnp.percentile(a=y_pred, q=jnp.array([5.0, 95.0]), axis=0)
 
     # make plots
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
@@ -188,14 +184,14 @@ def main(args):
         )
     )
     ax.plot(data.yte, "kx", label="y true")
-    ax.plot(mean_prediction, "ko", label="y pred")
+    ax.plot(median_prediction, "ko", label="y pred")
     ax.set(xlabel="example", ylabel="y", title="Mean predictions with 90% CI")
     ax.legend()
     fig.savefig("stein_bnn.pdf")
 
 
 if __name__ == "__main__":
-    jax.config.update("jax_debug_nans", True)
+    config.update("jax_debug_nans", True)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--subsample-size", type=int, default=100)
@@ -211,6 +207,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    numpyro.set_platform(args.device)
+    set_platform(args.device)
 
     main(args)

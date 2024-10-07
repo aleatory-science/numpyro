@@ -26,6 +26,7 @@ from numpyro.infer.autoguide import AutoGuide
 from numpyro.infer.util import _guess_max_plate_nesting, transform_fn
 from numpyro.optim import _NumPyroOptim
 from numpyro.util import fori_collect, ravel_pytree
+from numpyro.infer.elbo import Trace_ELBO
 
 SteinVIState = namedtuple("SteinVIState", ["optim_state", "rng_key"])
 SteinVIRunResult = namedtuple("SteinRunResult", ["params", "state", "losses"])
@@ -278,7 +279,7 @@ class SteinVI:
         particle_ljp_grads = kernel_particles_loss_fn(attractive_key, stein_particles)
 
         # 2.2 Compute non-mixture parameter gradients
-        non_mixture_param_grads = grad(
+        non_mixture_param_grads = grad(  
             lambda cps: -self.stein_loss.loss(
                 classic_key,
                 self.constrain_fn(cps),
@@ -519,40 +520,6 @@ class SteinVI:
 
         state = extract(last_res)
         return SteinVIRunResult(self.get_params(state), state, auxiliaries)
-
-    # def run(
-    #     self,
-    #     rng_key,
-    #     num_steps,
-    #     *args,
-    #     progress_bar=True,
-    #     init_state=None,
-    #     collect_fn=lambda val: val[1],  # TODO: refactor
-    #     **kwargs,
-    # ):
-    #     def bodyfn(_i, info):
-    #         body_state = info[0]
-    #         return (*self.update(body_state, *info[2:], **kwargs), *info[2:])
-
-    #     if init_state is None:
-    #         state = self.init(rng_key, *args, **kwargs)
-    #     else:
-    #         state = init_state
-    #     loss = self.evaluate(state, *args, **kwargs)
-    #     auxiliaries, last_res = fori_collect(
-    #         0,
-    #         num_steps,
-    #         lambda info: bodyfn(0, info),
-    #         (state, loss, *args),
-    #         progbar=progress_bar,
-    #         transform=collect_fn,
-    #         return_last_val=True,
-    #         diagnostics_fn=lambda state: f"norm Stein force: {state[1]:.3f}"
-    #         if progress_bar
-    #         else None,
-    #     )
-    #     state = last_res[0]
-    #     return SteinVIRunResult(self.get_params(state), state, auxiliaries)
 
     def evaluate(self, state, *args, **kwargs):
         """
